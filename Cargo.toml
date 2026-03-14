@@ -3,7 +3,7 @@ name = "matrirc"
 version = "0.1.0"
 edition = "2021"
 description = "Local IRC server that bridges to a Matrix homeserver"
-license = "MIT OR Apache-2.0"
+license = "GPL-3.0-or-later"
 
 [dependencies]
 tokio = { version = "1", features = ["net", "io-util", "rt-multi-thread", "macros", "sync"] }
