@@ -1,0 +1,17 @@
+[package]
+name = "matrirc"
+version = "0.1.0"
+edition = "2021"
+description = "Local IRC server that bridges to a Matrix homeserver"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+tokio = { version = "1", features = ["net", "io-util", "rt-multi-thread", "macros", "sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+thiserror = "2"
+
+[profile.release]
+lto = "thin"
+strip = true
