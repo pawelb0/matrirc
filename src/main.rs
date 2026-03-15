@@ -1,11 +1,19 @@
+mod cli;
 mod irc;
 
 use anyhow::Result;
+use clap::Parser;
+
+use cli::{Cli, Command};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
-    irc::serve("127.0.0.1:6667").await
+    let args = Cli::parse();
+    match args.command.unwrap_or(Command::Run) {
+        Command::Run => irc::serve("127.0.0.1:6667").await,
+        Command::InstallIrssi { force, dry_run } => cli::install_irssi(force, dry_run),
+    }
 }
 
 fn init_tracing() {

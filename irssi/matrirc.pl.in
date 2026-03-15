@@ -1,0 +1,78 @@
+use strict;
+use warnings;
+use Irssi;
+use IO::Socket::INET;
+
+our $VERSION = '0.1.0';
+our %IRSSI = (
+    authors     => 'matrirc',
+    name        => 'matrirc',
+    description => 'Auto-start matrirc daemon and connect irssi to it',
+    license     => 'GPL-3.0-or-later',
+);
+
+my $BIN  = '__MATRIRC_BIN__';
+my $HOST = '127.0.0.1';
+my $PORT = 6667;
+my $STATE_DIR = "$ENV{HOME}/.local/state/matrirc";
+my $LOG       = "$STATE_DIR/log";
+
+my $start_time;
+my $tick_id;
+
+sub daemon_alive {
+    my $sock = IO::Socket::INET->new(
+        PeerHost => $HOST,
+        PeerPort => $PORT,
+        Proto    => 'tcp',
+        Timeout  => 1,
+    );
+    return 0 unless $sock;
+    close $sock;
+    return 1;
+}
+
+sub already_connected {
+    for my $s (Irssi::servers()) {
+        return 1 if $s->{address} eq $HOST && $s->{port} == $PORT;
+    }
+    return 0;
+}
+
+sub spawn_daemon {
+    Irssi::print("matrirc: starting daemon ($BIN)");
+    system("mkdir -p '$STATE_DIR'");
+    system("nohup '$BIN' run >>'$LOG' 2>&1 </dev/null &");
+}
+
+sub tick {
+    if (already_connected()) {
+        Irssi::timeout_remove($tick_id);
+        $tick_id = undef;
+        return;
+    }
+    if (daemon_alive()) {
+        Irssi::timeout_remove($tick_id);
+        $tick_id = undef;
+        Irssi::print("matrirc: daemon up, connecting");
+        Irssi::command("connect $HOST $PORT");
+        return;
+    }
+    if (time() - $start_time > 10) {
+        Irssi::timeout_remove($tick_id);
+        $tick_id = undef;
+        Irssi::print("matrirc: daemon failed to start within 10s; check $LOG");
+    }
+}
+
+sub init {
+    if (already_connected()) {
+        Irssi::print("matrirc: already connected");
+        return;
+    }
+    spawn_daemon() unless daemon_alive();
+    $start_time = time();
+    $tick_id = Irssi::timeout_add(200, 'tick', undef);
+}
+
+init();
