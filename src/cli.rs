@@ -1,7 +1,11 @@
+use std::io::Read;
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
+
+use crate::config::{config_path, Config};
+use crate::matrix;
 
 const PERL_TEMPLATE: &str = include_str!("../irssi/matrirc.pl.in");
 
@@ -25,6 +29,75 @@ pub enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Verify a Matrix access token and persist it to ~/.config/matrirc/config.toml.
+    /// Token is read from MATRIRC_TOKEN env var, or piped on stdin.
+    Login {
+        /// Your Matrix user ID, e.g. @you:matrix.org
+        mxid: String,
+        /// Override the homeserver URL instead of resolving via .well-known.
+        #[arg(long)]
+        homeserver: Option<String>,
+    },
+}
+
+pub async fn login(mxid: &str, homeserver_override: Option<&str>) -> Result<()> {
+    let server_name = matrix::server_name_from_mxid(mxid)?;
+    let token = read_token()?;
+
+    let http = reqwest::Client::builder()
+        .user_agent(concat!("matrirc/", env!("CARGO_PKG_VERSION")))
+        .build()?;
+
+    let homeserver_url = match homeserver_override {
+        Some(h) => h.trim_end_matches('/').to_string(),
+        None => matrix::discover_homeserver(&http, server_name).await?,
+    };
+
+    let who = matrix::whoami(&http, &homeserver_url, &token).await?;
+    if who.user_id != mxid {
+        return Err(anyhow!(
+            "token belongs to {} but you specified {mxid}",
+            who.user_id
+        ));
+    }
+    let device_id = who
+        .device_id
+        .ok_or_else(|| anyhow!("homeserver did not return a device_id; token may be guest"))?;
+
+    let cfg = Config {
+        mxid: mxid.to_string(),
+        homeserver_url: homeserver_url.clone(),
+        access_token: token,
+        device_id: device_id.clone(),
+    };
+    let path = config_path()?;
+    cfg.save(&path)?;
+
+    println!("logged in as {mxid} (device {device_id}) on {homeserver_url}");
+    println!("config written to {}", path.display());
+    Ok(())
+}
+
+fn read_token() -> Result<String> {
+    if let Ok(t) = std::env::var("MATRIRC_TOKEN") {
+        let t = t.trim().to_string();
+        if !t.is_empty() {
+            return Ok(t);
+        }
+    }
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() {
+        return Err(anyhow!(
+            "no token: set MATRIRC_TOKEN or pipe the token on stdin"
+        ));
+    }
+    let mut buf = String::new();
+    std::io::stdin().read_to_string(&mut buf).context("read stdin")?;
+    let t = buf.trim().to_string();
+    if t.is_empty() {
+        return Err(anyhow!("empty token on stdin"));
+    }
+    Ok(t)
 }
 
 pub fn install_irssi(force: bool, dry_run: bool) -> Result<()> {

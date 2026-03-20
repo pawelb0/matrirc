@@ -1,5 +1,7 @@
 mod cli;
+mod config;
 mod irc;
+mod matrix;
 
 use anyhow::Result;
 use clap::Parser;
@@ -13,6 +15,7 @@ async fn main() -> Result<()> {
     match args.command.unwrap_or(Command::Run) {
         Command::Run => irc::serve("127.0.0.1:6667").await,
         Command::InstallIrssi { force, dry_run } => cli::install_irssi(force, dry_run),
+        Command::Login { mxid, homeserver } => cli::login(&mxid, homeserver.as_deref()).await,
     }
 }
 
