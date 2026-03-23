@@ -5,7 +5,9 @@ use anyhow::{Context, Result};
 use tokio::net::TcpListener;
 use tracing::{error, info};
 
-pub async fn serve(addr: &str) -> Result<()> {
+use crate::bridge::Bridge;
+
+pub async fn serve(addr: &str, bridge: Bridge) -> Result<()> {
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("bind {addr}"))?;
@@ -13,8 +15,9 @@ pub async fn serve(addr: &str) -> Result<()> {
     loop {
         let (sock, peer) = listener.accept().await.context("accept")?;
         info!(%peer, "client connected");
+        let b = bridge.clone();
         tokio::spawn(async move {
-            if let Err(e) = conn::handle(sock, peer).await {
+            if let Err(e) = conn::handle(sock, peer, b).await {
                 error!(%peer, error = %e, "connection error");
             }
         });

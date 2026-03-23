@@ -3,12 +3,16 @@ use std::path::PathBuf;
 use anyhow::{anyhow, Context, Result};
 use matrix_sdk::authentication::matrix::MatrixSession;
 use matrix_sdk::config::SyncSettings;
-use matrix_sdk::ruma::events::room::message::SyncRoomMessageEvent;
+use matrix_sdk::ruma::events::room::message::{
+    MessageType, RoomMessageEventContent, SyncRoomMessageEvent,
+};
 use matrix_sdk::store::RoomLoadSettings;
 use matrix_sdk::{Client, Room, SessionMeta, SessionTokens};
 use serde::Deserialize;
+use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+use crate::bridge::{mxid_localpart, Bridge, FromMatrix, ToMatrix};
 use crate::config::Config;
 
 #[derive(Debug, Deserialize)]
@@ -66,7 +70,11 @@ pub fn store_path() -> Result<PathBuf> {
         .join("store"))
 }
 
-pub async fn run_sync(cfg: Config) -> Result<()> {
+pub async fn run_sync(
+    cfg: Config,
+    bridge: Bridge,
+    mut to_matrix: mpsc::Receiver<ToMatrix>,
+) -> Result<()> {
     let store = store_path()?;
     std::fs::create_dir_all(&store).with_context(|| format!("create {}", store.display()))?;
 
@@ -94,23 +102,79 @@ pub async fn run_sync(cfg: Config) -> Result<()> {
         .await
         .context("restore session")?;
 
-    info!("matrix: session restored, starting sync");
+    info!("matrix: session restored, running initial sync");
 
-    client.add_event_handler(|ev: SyncRoomMessageEvent, room: Room| async move {
-        let sender = ev.sender();
-        let body = match ev.as_original() {
-            Some(o) => format!("{:?}", o.content.msgtype),
-            None => "<redacted>".to_string(),
-        };
+    let initial = client
+        .sync_once(SyncSettings::default())
+        .await
+        .context("initial sync")?;
+    info!("matrix: initial sync done (next_batch={})", initial.next_batch);
+
+    for room in client.rooms() {
+        let name = room
+            .display_name()
+            .await
+            .map(|n| n.to_string())
+            .unwrap_or_else(|_| "<no name>".to_string());
         info!(
-            target: "matrirc::matrix",
+            target: "matrirc::rooms",
             room = %room.room_id(),
-            sender = %sender,
-            "{body}"
+            "{name} [{:?}]",
+            room.state()
         );
+    }
+
+    info!("matrix: starting incremental sync loop");
+
+    let bridge_for_handler = bridge.clone();
+    client.add_event_handler(move |ev: SyncRoomMessageEvent, room: Room| {
+        let bridge = bridge_for_handler.clone();
+        async move {
+            if !bridge.mapping.room_to_chan.contains_key(room.room_id()) {
+                return;
+            }
+            let Some(orig) = ev.as_original() else { return; };
+            // Suppress only events we just sent from IRC, identified by event ID.
+            // Other devices' messages from the same MXID still flow through.
+            if bridge.take_if_sent_by_us(&orig.event_id) {
+                return;
+            }
+            let body = match &orig.content.msgtype {
+                MessageType::Text(t) => t.body.clone(),
+                MessageType::Notice(t) => t.body.clone(),
+                MessageType::Emote(t) => format!("\x01ACTION {}\x01", t.body),
+                _ => return,
+            };
+            let nick = mxid_localpart(orig.sender.as_str()).to_string();
+            let _ = bridge.from_matrix.send(FromMatrix::Message {
+                room: room.room_id().to_owned(),
+                sender_nick: nick,
+                body,
+            });
+        }
     });
 
-    if let Err(e) = client.sync(SyncSettings::default()).await {
+    let send_client = client.clone();
+    let send_bridge = bridge.clone();
+    tokio::spawn(async move {
+        while let Some(cmd) = to_matrix.recv().await {
+            match cmd {
+                ToMatrix::Send { room, body } => match send_client.get_room(&room) {
+                    Some(r) => {
+                        let content = RoomMessageEventContent::text_plain(&body);
+                        match r.send(content).await {
+                            Ok(resp) => send_bridge.note_sent_by_us(resp.event_id),
+                            Err(e) => warn!("matrix send to {room} failed: {e}"),
+                        }
+                    }
+                    None => warn!("matrix room not found: {room}"),
+                },
+            }
+        }
+    });
+
+    let settings = SyncSettings::default().token(initial.next_batch);
+    if let Err(e) = client.sync(settings).await {
         warn!("sync ended: {e}");
     }
     Ok(())

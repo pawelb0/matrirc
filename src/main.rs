@@ -1,5 +1,6 @@
 #![recursion_limit = "256"]
 
+mod bridge;
 mod cli;
 mod config;
 mod irc;
@@ -24,12 +25,25 @@ async fn main() -> Result<()> {
 async fn run() -> Result<()> {
     use tracing::warn;
 
+    let mapping = bridge::Mapping::from_env();
+    let mapped_count = mapping.chan_to_room.len();
+    let (bridge_state, to_matrix_rx) = bridge::Bridge::new(mapping);
+    if mapped_count > 0 {
+        tracing::info!(
+            "bridge: {mapped_count} room(s) mapped: {:?}",
+            bridge_state.mapping.chan_to_room.keys().collect::<Vec<_>>()
+        );
+    } else {
+        tracing::info!("bridge: no rooms mapped (set MATRIRC_ROOM=!id:server to map one to #matrix)");
+    }
+
     let cfg_path = config::config_path()?;
     let matrix_handle = match config::Config::load(&cfg_path) {
         Ok(cfg) => {
             tracing::info!("matrix: config loaded from {}", cfg_path.display());
+            let b = bridge_state.clone();
             Some(tokio::spawn(async move {
-                if let Err(e) = matrix::run_sync(cfg).await {
+                if let Err(e) = matrix::run_sync(cfg, b, to_matrix_rx).await {
                     warn!("matrix sync error: {e:#}");
                 }
             }))
@@ -43,7 +57,7 @@ async fn run() -> Result<()> {
         }
     };
 
-    let irc_result = irc::serve("127.0.0.1:6667").await;
+    let irc_result = irc::serve("127.0.0.1:6667", bridge_state).await;
     if let Some(h) = matrix_handle {
         h.abort();
     }

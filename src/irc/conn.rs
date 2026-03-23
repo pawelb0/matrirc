@@ -5,9 +5,11 @@ use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::TcpStream;
+use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
 use super::proto::Message;
+use crate::bridge::{Bridge, FromMatrix, ToMatrix};
 
 const SERVER_NAME: &str = "matrirc.local";
 const VERSION: &str = concat!("matrirc-", env!("CARGO_PKG_VERSION"));
@@ -18,76 +20,111 @@ const ECHO_PREFIX: &str = "echo!echo@matrirc.local";
 const ECHO_CHAN: &str = "#echo";
 const ECHO_TOPIC: &str = "Echo channel — anything you say, echo will say back";
 
-pub async fn handle(sock: TcpStream, peer: SocketAddr) -> Result<()> {
+pub async fn handle(sock: TcpStream, peer: SocketAddr, bridge: Bridge) -> Result<()> {
     let (read, mut write) = sock.into_split();
     let mut lines = BufReader::new(read).lines();
+    let mut from_matrix = bridge.from_matrix.subscribe();
 
     let mut nick: Option<String> = None;
     let mut user: Option<String> = None;
     let mut registered = false;
     let mut joined: HashSet<String> = HashSet::new();
 
-    while let Some(line) = read_line(&mut lines).await? {
-        let msg = match Message::parse(&line) {
-            Ok(m) => m,
-            Err(e) => {
-                debug!(%peer, error = %e, raw = %line, "skipping malformed line");
-                continue;
-            }
-        };
-
-        match msg.command.as_str() {
-            "CAP" => handle_cap(&mut write, &msg).await?,
-            "NICK" => {
-                if let Some(n) = msg.params.first() {
-                    nick = Some(n.clone());
+    loop {
+        tokio::select! {
+            line_res = read_line(&mut lines) => {
+                let Some(line) = line_res? else { break; };
+                let msg = match Message::parse(&line) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        debug!(%peer, error = %e, raw = %line, "skipping malformed line");
+                        continue;
+                    }
+                };
+                if handle_command(&mut write, &peer, &bridge, &msg, &mut nick, &mut user, &mut joined).await? {
+                    return Ok(());
+                }
+                if !registered {
+                    if let (Some(n), Some(_)) = (&nick, &user) {
+                        send_welcome(&mut write, n).await?;
+                        registered = true;
+                    }
                 }
             }
-            "USER" => {
-                if let Some(u) = msg.params.first() {
-                    user = Some(u.clone());
+            ev = from_matrix.recv() => {
+                match ev {
+                    Ok(FromMatrix::Message { room, sender_nick, body }) => {
+                        let Some(chan) = bridge.mapping.room_to_chan.get(&room) else { continue; };
+                        if !joined.contains(chan) { continue; }
+                        let prefix = format!("{sender_nick}!{sender_nick}@matrix");
+                        for piece in body.split('\n') {
+                            if piece.is_empty() { continue; }
+                            send(&mut write, Message::with_prefix(&prefix, "PRIVMSG", vec![chan.clone(), piece.to_string()])).await?;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!(%peer, "irc client lagged {n} matrix events");
+                    }
                 }
-            }
-            "PING" => {
-                let token = msg.params.first().cloned().unwrap_or_default();
-                send(&mut write, srv("PONG", vec![SERVER_NAME.into(), token])).await?;
-            }
-            "JOIN" => {
-                if let Some(n) = nick.as_deref() {
-                    handle_join(&mut write, n, &msg, &mut joined).await?;
-                }
-            }
-            "PART" => {
-                if let Some(n) = nick.as_deref() {
-                    handle_part(&mut write, n, &msg, &mut joined).await?;
-                }
-            }
-            "PRIVMSG" => {
-                if let Some(n) = nick.as_deref() {
-                    handle_privmsg(&mut write, n, &msg).await?;
-                }
-            }
-            "NOTICE" => {
-                debug!(?msg, "client NOTICE ignored");
-            }
-            "QUIT" => {
-                let _ = write.shutdown().await;
-                info!(%peer, "client quit");
-                return Ok(());
-            }
-            other => debug!(%peer, command = %other, "ignoring unsupported command"),
-        }
-
-        if !registered {
-            if let (Some(n), Some(_)) = (&nick, &user) {
-                send_welcome(&mut write, n).await?;
-                registered = true;
             }
         }
     }
 
     info!(%peer, "client disconnected");
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_command(
+    write: &mut OwnedWriteHalf,
+    peer: &SocketAddr,
+    bridge: &Bridge,
+    msg: &Message,
+    nick: &mut Option<String>,
+    user: &mut Option<String>,
+    joined: &mut HashSet<String>,
+) -> Result<bool> {
+    match msg.command.as_str() {
+        "CAP" => handle_cap(write, msg).await?,
+        "NICK" => {
+            if let Some(n) = msg.params.first() {
+                *nick = Some(n.clone());
+            }
+        }
+        "USER" => {
+            if let Some(u) = msg.params.first() {
+                *user = Some(u.clone());
+            }
+        }
+        "PING" => {
+            let token = msg.params.first().cloned().unwrap_or_default();
+            send(write, srv("PONG", vec![SERVER_NAME.into(), token])).await?;
+        }
+        "JOIN" => {
+            if let Some(n) = nick.as_deref() {
+                handle_join(write, n, msg, joined, bridge).await?;
+            }
+        }
+        "PART" => {
+            if let Some(n) = nick.as_deref() {
+                handle_part(write, n, msg, joined).await?;
+            }
+        }
+        "PRIVMSG" => {
+            if let Some(n) = nick.as_deref() {
+                handle_privmsg(write, n, msg, bridge).await?;
+            }
+        }
+        "NOTICE" => debug!(?msg, "client NOTICE ignored"),
+        "QUIT" => {
+            let _ = write.shutdown().await;
+            info!(%peer, "client quit");
+            return Ok(true);
+        }
+        other => debug!(%peer, command = %other, "ignoring unsupported command"),
+    }
+    Ok(false)
 }
 
 async fn handle_cap(write: &mut OwnedWriteHalf, msg: &Message) -> Result<()> {
@@ -113,21 +150,29 @@ async fn handle_join(
     nick: &str,
     msg: &Message,
     joined: &mut HashSet<String>,
+    bridge: &Bridge,
 ) -> Result<()> {
     let Some(target) = msg.params.first() else { return Ok(()); };
     for chan in target.split(',') {
         let chan = chan.trim();
-        if chan != ECHO_CHAN {
+        let (topic, names) = if chan == ECHO_CHAN {
+            (ECHO_TOPIC.to_string(), format!("{nick} {ECHO_NICK}"))
+        } else if let Some(room_id) = bridge.mapping.chan_to_room.get(chan) {
+            (
+                format!("Matrix room {room_id}"),
+                format!("{nick} matrix"),
+            )
+        } else {
             send(write, srv("403", vec![nick.into(), chan.into(), "No such channel".into()])).await?;
             continue;
-        }
+        };
         if !joined.insert(chan.to_string()) {
             continue;
         }
         let user_prefix = format!("{nick}!{nick}@matrirc.local");
         send(write, Message::with_prefix(user_prefix, "JOIN", vec![chan.into()])).await?;
-        send(write, srv("332", vec![nick.into(), chan.into(), ECHO_TOPIC.into()])).await?;
-        send(write, srv("353", vec![nick.into(), "=".into(), chan.into(), format!("{nick} {ECHO_NICK}")])).await?;
+        send(write, srv("332", vec![nick.into(), chan.into(), topic])).await?;
+        send(write, srv("353", vec![nick.into(), "=".into(), chan.into(), names])).await?;
         send(write, srv("366", vec![nick.into(), chan.into(), "End of /NAMES list".into()])).await?;
     }
     Ok(())
@@ -156,21 +201,34 @@ async fn handle_part(
     Ok(())
 }
 
-async fn handle_privmsg(write: &mut OwnedWriteHalf, nick: &str, msg: &Message) -> Result<()> {
+async fn handle_privmsg(
+    write: &mut OwnedWriteHalf,
+    nick: &str,
+    msg: &Message,
+    bridge: &Bridge,
+) -> Result<()> {
     let Some(target) = msg.params.first() else { return Ok(()); };
     let Some(text) = msg.params.get(1) else { return Ok(()); };
 
-    let echo_target: &str = if target == ECHO_CHAN {
-        ECHO_CHAN
-    } else if target.eq_ignore_ascii_case(ECHO_NICK) {
-        nick
-    } else {
-        send(write, srv("401", vec![nick.into(), target.clone(), "No such nick/channel".into()])).await?;
+    if target == ECHO_CHAN || target.eq_ignore_ascii_case(ECHO_NICK) {
+        let echo_target: &str = if target == ECHO_CHAN { ECHO_CHAN } else { nick };
+        let body = format!("echo: {text}");
+        send(write, Message::with_prefix(ECHO_PREFIX, "PRIVMSG", vec![echo_target.into(), body])).await?;
         return Ok(());
-    };
+    }
 
-    let body = format!("echo: {text}");
-    send(write, Message::with_prefix(ECHO_PREFIX, "PRIVMSG", vec![echo_target.into(), body])).await?;
+    if let Some(room) = bridge.mapping.chan_to_room.get(target) {
+        if let Err(e) = bridge.to_matrix.try_send(ToMatrix::Send {
+            room: room.clone(),
+            body: text.clone(),
+        }) {
+            warn!("dropping outbound matrix message: {e}");
+            send(write, srv("NOTICE", vec![nick.into(), format!("matrix send dropped: {e}")])).await?;
+        }
+        return Ok(());
+    }
+
+    send(write, srv("401", vec![nick.into(), target.clone(), "No such nick/channel".into()])).await?;
     Ok(())
 }
 
