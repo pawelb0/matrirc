@@ -3,8 +3,12 @@ use std::path::PathBuf;
 use anyhow::{anyhow, Context, Result};
 use matrix_sdk::authentication::matrix::MatrixSession;
 use matrix_sdk::config::SyncSettings;
+use matrix_sdk::room::MessagesOptions;
 use matrix_sdk::ruma::events::room::message::{
     MessageType, RoomMessageEventContent, SyncRoomMessageEvent,
+};
+use matrix_sdk::ruma::events::{
+    AnySyncMessageLikeEvent, AnySyncTimelineEvent, SyncMessageLikeEvent,
 };
 use matrix_sdk::store::RoomLoadSettings;
 use matrix_sdk::{Client, Room, SessionMeta, SessionTokens};
@@ -12,7 +16,7 @@ use serde::Deserialize;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::bridge::{mxid_localpart, Bridge, FromMatrix, ToMatrix};
+use crate::bridge::{mxid_localpart, BackfillMessage, Bridge, FromMatrix, ToMatrix};
 use crate::config::Config;
 
 #[derive(Debug, Deserialize)]
@@ -56,6 +60,36 @@ pub async fn discover_homeserver(http: &reqwest::Client, server_name: &str) -> R
         }
     }
     Ok(format!("https://{server_name}"))
+}
+
+async fn backfill(client: &Client, room_id: &matrix_sdk::ruma::RoomId, limit: u32) -> Vec<BackfillMessage> {
+    let Some(room) = client.get_room(room_id) else { return Vec::new(); };
+    let mut opts = MessagesOptions::backward();
+    opts.limit = limit.into();
+    let msgs = match room.messages(opts).await {
+        Ok(m) => m,
+        Err(e) => {
+            warn!("backfill {room_id} failed: {e}");
+            return Vec::new();
+        }
+    };
+    let mut out = Vec::new();
+    for ev in msgs.chunk.iter().rev() {
+        let Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
+            SyncMessageLikeEvent::Original(orig),
+        ))) = ev.raw().deserialize() else { continue; };
+        let body = match &orig.content.msgtype {
+            MessageType::Text(t) => t.body.clone(),
+            MessageType::Notice(t) => t.body.clone(),
+            MessageType::Emote(t) => format!("\x01ACTION {}\x01", t.body),
+            _ => continue,
+        };
+        out.push(BackfillMessage {
+            sender_nick: mxid_localpart(orig.sender.as_str()).to_string(),
+            body,
+        });
+    }
+    out
 }
 
 pub fn store_path() -> Result<PathBuf> {
@@ -169,6 +203,10 @@ pub async fn run_sync(
                     }
                     None => warn!("matrix room not found: {room}"),
                 },
+                ToMatrix::Backfill { room, limit, reply } => {
+                    let result = backfill(&send_client, &room, limit).await;
+                    let _ = reply.send(result);
+                }
             }
         }
     });

@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use matrix_sdk::ruma::{EventId, OwnedEventId, OwnedRoomId, RoomId};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 const RECENT_SENT_CAP: usize = 256;
 
@@ -42,7 +42,21 @@ pub enum FromMatrix {
 
 #[derive(Debug)]
 pub enum ToMatrix {
-    Send { room: OwnedRoomId, body: String },
+    Send {
+        room: OwnedRoomId,
+        body: String,
+    },
+    Backfill {
+        room: OwnedRoomId,
+        limit: u32,
+        reply: oneshot::Sender<Vec<BackfillMessage>>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct BackfillMessage {
+    pub sender_nick: String,
+    pub body: String,
 }
 
 #[derive(Clone)]

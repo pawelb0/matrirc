@@ -155,9 +155,10 @@ async fn handle_join(
     let Some(target) = msg.params.first() else { return Ok(()); };
     for chan in target.split(',') {
         let chan = chan.trim();
+        let bridged_room = bridge.mapping.chan_to_room.get(chan).cloned();
         let (topic, names) = if chan == ECHO_CHAN {
             (ECHO_TOPIC.to_string(), format!("{nick} {ECHO_NICK}"))
-        } else if let Some(room_id) = bridge.mapping.chan_to_room.get(chan) {
+        } else if let Some(ref room_id) = bridged_room {
             (
                 format!("Matrix room {room_id}"),
                 format!("{nick} matrix"),
@@ -170,10 +171,47 @@ async fn handle_join(
             continue;
         }
         let user_prefix = format!("{nick}!{nick}@matrirc.local");
-        send(write, Message::with_prefix(user_prefix, "JOIN", vec![chan.into()])).await?;
+        send(write, Message::with_prefix(&user_prefix, "JOIN", vec![chan.into()])).await?;
         send(write, srv("332", vec![nick.into(), chan.into(), topic])).await?;
         send(write, srv("353", vec![nick.into(), "=".into(), chan.into(), names])).await?;
         send(write, srv("366", vec![nick.into(), chan.into(), "End of /NAMES list".into()])).await?;
+
+        if let Some(room) = bridged_room {
+            backfill_channel(write, chan, &room, bridge).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn backfill_channel(
+    write: &mut OwnedWriteHalf,
+    chan: &str,
+    room: &matrix_sdk::ruma::OwnedRoomId,
+    bridge: &Bridge,
+) -> Result<()> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if bridge
+        .to_matrix
+        .try_send(ToMatrix::Backfill {
+            room: room.clone(),
+            limit: 20,
+            reply: tx,
+        })
+        .is_err()
+    {
+        warn!(%chan, "backfill: channel full or matrix sync down");
+        return Ok(());
+    }
+    let msgs = match rx.await {
+        Ok(m) => m,
+        Err(_) => return Ok(()),
+    };
+    for m in msgs {
+        let prefix = format!("{}!{0}@matrix", m.sender_nick);
+        for piece in m.body.split('\n') {
+            if piece.is_empty() { continue; }
+            send(write, Message::with_prefix(&prefix, "PRIVMSG", vec![chan.into(), piece.into()])).await?;
+        }
     }
     Ok(())
 }
