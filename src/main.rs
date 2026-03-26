@@ -5,6 +5,7 @@ mod cli;
 mod config;
 mod irc;
 mod matrix;
+mod names;
 
 use anyhow::Result;
 use clap::Parser;
@@ -23,27 +24,34 @@ async fn main() -> Result<()> {
 }
 
 async fn run() -> Result<()> {
+    use std::sync::Arc;
     use tracing::warn;
 
-    let mapping = bridge::Mapping::from_env();
-    let mapped_count = mapping.chan_to_room.len();
-    let (bridge_state, to_matrix_rx) = bridge::Bridge::new(mapping);
-    if mapped_count > 0 {
-        tracing::info!(
-            "bridge: {mapped_count} room(s) mapped: {:?}",
-            bridge_state.mapping.chan_to_room.keys().collect::<Vec<_>>()
-        );
-    } else {
-        tracing::info!("bridge: no rooms mapped (set MATRIRC_ROOM=!id:server to map one to #matrix)");
-    }
+    let override_pair = bridge::env_override();
+    let (bridge_state, to_matrix_rx) = bridge::Bridge::new(bridge::Mapping::default());
+    let env_override_room = match override_pair {
+        Some((room, chan)) => {
+            tracing::info!("bridge: MATRIRC_ROOM override active, only bridging {room} as {chan}");
+            Some(room)
+        }
+        None => {
+            tracing::info!("bridge: auto-discovering all Joined rooms after sync");
+            None
+        }
+    };
+
+    let store_path = names::default_store_path()?;
+    let name_store = Arc::new(names::NameStore::load(store_path)?);
 
     let cfg_path = config::config_path()?;
     let matrix_handle = match config::Config::load(&cfg_path) {
         Ok(cfg) => {
             tracing::info!("matrix: config loaded from {}", cfg_path.display());
             let b = bridge_state.clone();
+            let ns = name_store.clone();
+            let only = env_override_room.clone();
             Some(tokio::spawn(async move {
-                if let Err(e) = matrix::run_sync(cfg, b, to_matrix_rx).await {
+                if let Err(e) = matrix::run_sync(cfg, b, to_matrix_rx, ns, only).await {
                     warn!("matrix sync error: {e:#}");
                 }
             }))

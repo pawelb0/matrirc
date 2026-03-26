@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use matrix_sdk::authentication::matrix::MatrixSession;
@@ -11,13 +12,14 @@ use matrix_sdk::ruma::events::{
     AnySyncMessageLikeEvent, AnySyncTimelineEvent, SyncMessageLikeEvent,
 };
 use matrix_sdk::store::RoomLoadSettings;
-use matrix_sdk::{Client, Room, SessionMeta, SessionTokens};
+use matrix_sdk::{Client, Room, RoomState, SessionMeta, SessionTokens};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::bridge::{mxid_localpart, BackfillMessage, Bridge, FromMatrix, ToMatrix};
 use crate::config::Config;
+use crate::names::{preferred_channel_name, NameStore};
 
 #[derive(Debug, Deserialize)]
 struct WellKnown {
@@ -108,6 +110,8 @@ pub async fn run_sync(
     cfg: Config,
     bridge: Bridge,
     mut to_matrix: mpsc::Receiver<ToMatrix>,
+    name_store: Arc<NameStore>,
+    env_override_room: Option<matrix_sdk::ruma::OwnedRoomId>,
 ) -> Result<()> {
     let store = store_path()?;
     std::fs::create_dir_all(&store).with_context(|| format!("create {}", store.display()))?;
@@ -150,21 +154,46 @@ pub async fn run_sync(
             .await
             .map(|n| n.to_string())
             .unwrap_or_else(|_| "<no name>".to_string());
+        let state = room.state();
         info!(
             target: "matrirc::rooms",
             room = %room.room_id(),
             "{name} [{:?}]",
-            room.state()
+            state
         );
+
+        if !matches!(state, RoomState::Joined) {
+            continue;
+        }
+        if let Some(only) = &env_override_room {
+            if room.room_id() != only {
+                continue;
+            }
+        }
+
+        let preferred = preferred_channel_name(room.room_id(), Some(&name));
+        let chan = match name_store.assign_or_get(room.room_id(), &preferred) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("name assign failed for {}: {e}", room.room_id());
+                continue;
+            }
+        };
+        let topic = room.topic().unwrap_or_else(|| name.clone());
+        bridge.add_mapping(room.room_id().to_owned(), chan, topic);
     }
 
+    info!(
+        "matrix: {} room(s) bridged",
+        bridge.snapshot().len()
+    );
     info!("matrix: starting incremental sync loop");
 
     let bridge_for_handler = bridge.clone();
     client.add_event_handler(move |ev: SyncRoomMessageEvent, room: Room| {
         let bridge = bridge_for_handler.clone();
         async move {
-            if !bridge.mapping.room_to_chan.contains_key(room.room_id()) {
+            if !bridge.has_room(room.room_id()) {
                 return;
             }
             let Some(orig) = ev.as_original() else { return; };

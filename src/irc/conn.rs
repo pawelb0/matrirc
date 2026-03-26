@@ -48,18 +48,30 @@ pub async fn handle(sock: TcpStream, peer: SocketAddr, bridge: Bridge) -> Result
                     if let (Some(n), Some(_)) = (&nick, &user) {
                         send_welcome(&mut write, n).await?;
                         registered = true;
+                        auto_join_all(&mut write, n, &bridge, &mut joined).await?;
                     }
                 }
             }
             ev = from_matrix.recv() => {
                 match ev {
                     Ok(FromMatrix::Message { room, sender_nick, body }) => {
-                        let Some(chan) = bridge.mapping.room_to_chan.get(&room) else { continue; };
-                        if !joined.contains(chan) { continue; }
+                        let Some(chan) = bridge.chan_for(&room) else { continue; };
+                        if !joined.contains(&chan) { continue; }
                         let prefix = format!("{sender_nick}!{sender_nick}@matrix");
                         for piece in body.split('\n') {
                             if piece.is_empty() { continue; }
                             send(&mut write, Message::with_prefix(&prefix, "PRIVMSG", vec![chan.clone(), piece.to_string()])).await?;
+                        }
+                    }
+                    Ok(FromMatrix::RoomAdded { room, chan, topic }) => {
+                        if !registered {
+                            // will be picked up by auto_join_all on registration
+                            continue;
+                        }
+                        if joined.contains(&chan) { continue; }
+                        if let Some(n) = nick.as_deref() {
+                            join_bridged(&mut write, n, &chan, &room, &topic, &bridge).await?;
+                            joined.insert(chan);
                         }
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
@@ -155,30 +167,67 @@ async fn handle_join(
     let Some(target) = msg.params.first() else { return Ok(()); };
     for chan in target.split(',') {
         let chan = chan.trim();
-        let bridged_room = bridge.mapping.chan_to_room.get(chan).cloned();
-        let (topic, names) = if chan == ECHO_CHAN {
-            (ECHO_TOPIC.to_string(), format!("{nick} {ECHO_NICK}"))
-        } else if let Some(ref room_id) = bridged_room {
-            (
-                format!("Matrix room {room_id}"),
-                format!("{nick} matrix"),
-            )
-        } else {
-            send(write, srv("403", vec![nick.into(), chan.into(), "No such channel".into()])).await?;
-            continue;
-        };
-        if !joined.insert(chan.to_string()) {
+        if joined.contains(chan) {
             continue;
         }
-        let user_prefix = format!("{nick}!{nick}@matrirc.local");
-        send(write, Message::with_prefix(&user_prefix, "JOIN", vec![chan.into()])).await?;
-        send(write, srv("332", vec![nick.into(), chan.into(), topic])).await?;
-        send(write, srv("353", vec![nick.into(), "=".into(), chan.into(), names])).await?;
-        send(write, srv("366", vec![nick.into(), chan.into(), "End of /NAMES list".into()])).await?;
+        if chan == ECHO_CHAN {
+            join_echo(write, nick, joined).await?;
+            continue;
+        }
+        if let Some(room) = bridge.room_for(chan) {
+            let topic = format!("Matrix room {room}");
+            join_bridged(write, nick, chan, &room, &topic, bridge).await?;
+            joined.insert(chan.to_string());
+            continue;
+        }
+        send(write, srv("403", vec![nick.into(), chan.into(), "No such channel".into()])).await?;
+    }
+    Ok(())
+}
 
-        if let Some(room) = bridged_room {
-            backfill_channel(write, chan, &room, bridge).await?;
-        }
+async fn join_echo(
+    write: &mut OwnedWriteHalf,
+    nick: &str,
+    joined: &mut HashSet<String>,
+) -> Result<()> {
+    let user_prefix = format!("{nick}!{nick}@matrirc.local");
+    send(write, Message::with_prefix(&user_prefix, "JOIN", vec![ECHO_CHAN.into()])).await?;
+    send(write, srv("332", vec![nick.into(), ECHO_CHAN.into(), ECHO_TOPIC.into()])).await?;
+    send(write, srv("353", vec![nick.into(), "=".into(), ECHO_CHAN.into(), format!("{nick} {ECHO_NICK}")])).await?;
+    send(write, srv("366", vec![nick.into(), ECHO_CHAN.into(), "End of /NAMES list".into()])).await?;
+    joined.insert(ECHO_CHAN.to_string());
+    Ok(())
+}
+
+async fn join_bridged(
+    write: &mut OwnedWriteHalf,
+    nick: &str,
+    chan: &str,
+    room: &matrix_sdk::ruma::RoomId,
+    topic: &str,
+    bridge: &Bridge,
+) -> Result<()> {
+    let user_prefix = format!("{nick}!{nick}@matrirc.local");
+    send(write, Message::with_prefix(&user_prefix, "JOIN", vec![chan.into()])).await?;
+    send(write, srv("332", vec![nick.into(), chan.into(), topic.into()])).await?;
+    send(write, srv("353", vec![nick.into(), "=".into(), chan.into(), format!("{nick} matrix")])).await?;
+    send(write, srv("366", vec![nick.into(), chan.into(), "End of /NAMES list".into()])).await?;
+    backfill_channel(write, chan, room, bridge).await?;
+    Ok(())
+}
+
+async fn auto_join_all(
+    write: &mut OwnedWriteHalf,
+    nick: &str,
+    bridge: &Bridge,
+    joined: &mut HashSet<String>,
+) -> Result<()> {
+    let snapshot = bridge.snapshot();
+    for (chan, room) in snapshot {
+        if joined.contains(&chan) { continue; }
+        let topic = format!("Matrix room {room}");
+        join_bridged(write, nick, &chan, &room, &topic, bridge).await?;
+        joined.insert(chan);
     }
     Ok(())
 }
@@ -186,14 +235,14 @@ async fn handle_join(
 async fn backfill_channel(
     write: &mut OwnedWriteHalf,
     chan: &str,
-    room: &matrix_sdk::ruma::OwnedRoomId,
+    room: &matrix_sdk::ruma::RoomId,
     bridge: &Bridge,
 ) -> Result<()> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     if bridge
         .to_matrix
         .try_send(ToMatrix::Backfill {
-            room: room.clone(),
+            room: room.to_owned(),
             limit: 20,
             reply: tx,
         })
@@ -255,9 +304,9 @@ async fn handle_privmsg(
         return Ok(());
     }
 
-    if let Some(room) = bridge.mapping.chan_to_room.get(target) {
+    if let Some(room) = bridge.room_for(target) {
         if let Err(e) = bridge.to_matrix.try_send(ToMatrix::Send {
-            room: room.clone(),
+            room,
             body: text.clone(),
         }) {
             warn!("dropping outbound matrix message: {e}");

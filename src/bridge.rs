@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use matrix_sdk::ruma::{EventId, OwnedEventId, OwnedRoomId, RoomId};
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -18,16 +18,18 @@ impl Mapping {
         self.chan_to_room.insert(chan.clone(), room.clone());
         self.room_to_chan.insert(room, chan);
     }
+}
 
-    pub fn from_env() -> Self {
-        let mut m = Self::default();
-        if let Some(s) = std::env::var("MATRIRC_ROOM").ok().filter(|s| !s.is_empty()) {
-            match RoomId::parse(&s) {
-                Ok(room) => m.insert(room, "#matrix"),
-                Err(e) => tracing::warn!("MATRIRC_ROOM not a valid room id ({s}): {e}"),
-            }
+/// If MATRIRC_ROOM is set, returns a one-entry override mapping for dev. Else None,
+/// meaning the caller should auto-discover rooms after sync.
+pub fn env_override() -> Option<(OwnedRoomId, &'static str)> {
+    let s = std::env::var("MATRIRC_ROOM").ok().filter(|s| !s.is_empty())?;
+    match RoomId::parse(&s) {
+        Ok(room) => Some((room, "#matrix")),
+        Err(e) => {
+            tracing::warn!("MATRIRC_ROOM not a valid room id ({s}): {e}");
+            None
         }
-        m
     }
 }
 
@@ -37,6 +39,11 @@ pub enum FromMatrix {
         room: OwnedRoomId,
         sender_nick: String,
         body: String,
+    },
+    RoomAdded {
+        room: OwnedRoomId,
+        chan: String,
+        topic: String,
     },
 }
 
@@ -61,7 +68,7 @@ pub struct BackfillMessage {
 
 #[derive(Clone)]
 pub struct Bridge {
-    pub mapping: Arc<Mapping>,
+    pub mapping: Arc<RwLock<Mapping>>,
     pub from_matrix: broadcast::Sender<FromMatrix>,
     pub to_matrix: mpsc::Sender<ToMatrix>,
     recent_sent: Arc<Mutex<VecDeque<OwnedEventId>>>,
@@ -73,13 +80,44 @@ impl Bridge {
         let (to_tx, to_rx) = mpsc::channel(64);
         (
             Self {
-                mapping: Arc::new(mapping),
+                mapping: Arc::new(RwLock::new(mapping)),
                 from_matrix: from_tx,
                 to_matrix: to_tx,
                 recent_sent: Arc::new(Mutex::new(VecDeque::with_capacity(RECENT_SENT_CAP))),
             },
             to_rx,
         )
+    }
+
+    /// Adds the mapping + broadcasts RoomAdded so live IRC connections auto-join.
+    pub fn add_mapping(&self, room: OwnedRoomId, chan: String, topic: String) {
+        let mut m = self.mapping.write().unwrap();
+        m.insert(room.clone(), chan.clone());
+        drop(m);
+        let _ = self.from_matrix.send(FromMatrix::RoomAdded { room, chan, topic });
+    }
+
+    pub fn chan_for(&self, room: &RoomId) -> Option<String> {
+        self.mapping.read().unwrap().room_to_chan.get(room).cloned()
+    }
+
+    pub fn room_for(&self, chan: &str) -> Option<OwnedRoomId> {
+        self.mapping.read().unwrap().chan_to_room.get(chan).cloned()
+    }
+
+    pub fn has_room(&self, room: &RoomId) -> bool {
+        self.mapping.read().unwrap().room_to_chan.contains_key(room)
+    }
+
+    /// Snapshot of all (chan, room, topic) for bulk auto-join.
+    pub fn snapshot(&self) -> Vec<(String, OwnedRoomId)> {
+        self.mapping
+            .read()
+            .unwrap()
+            .chan_to_room
+            .iter()
+            .map(|(c, r)| (c.clone(), r.clone()))
+            .collect()
     }
 
     pub fn note_sent_by_us(&self, id: OwnedEventId) {
@@ -126,5 +164,23 @@ mod tests {
         m.insert(r.clone(), "#matrix");
         assert_eq!(m.room_to_chan.get(&r), Some(&"#matrix".to_string()));
         assert_eq!(m.chan_to_room.get("#matrix"), Some(&r));
+    }
+
+    #[test]
+    fn bridge_add_mapping_broadcasts() {
+        let (b, _rx) = Bridge::new(Mapping::default());
+        let mut sub = b.from_matrix.subscribe();
+        let r = RoomId::parse("!abc:server.org").unwrap();
+        b.add_mapping(r.clone(), "#test-abc".into(), "topic".into());
+        let ev = sub.try_recv().unwrap();
+        match ev {
+            FromMatrix::RoomAdded { room, chan, topic } => {
+                assert_eq!(room, r);
+                assert_eq!(chan, "#test-abc");
+                assert_eq!(topic, "topic");
+            }
+            _ => panic!("wrong event"),
+        }
+        assert_eq!(b.chan_for(&r), Some("#test-abc".into()));
     }
 }
