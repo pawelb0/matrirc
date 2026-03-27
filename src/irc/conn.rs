@@ -55,23 +55,35 @@ pub async fn handle(sock: TcpStream, peer: SocketAddr, bridge: Bridge) -> Result
             ev = from_matrix.recv() => {
                 match ev {
                     Ok(FromMatrix::Message { room, sender_nick, body }) => {
-                        let Some(chan) = bridge.chan_for(&room) else { continue; };
-                        if !joined.contains(&chan) { continue; }
+                        let target = if let Some(chan) = bridge.chan_for(&room) {
+                            if !joined.contains(&chan) { continue; }
+                            chan
+                        } else if bridge.dm_nick_for(&room).is_some() {
+                            // DM: deliver to the client's own nick so irssi opens a query window
+                            match nick.as_deref() { Some(n) => n.to_string(), None => continue }
+                        } else {
+                            continue;
+                        };
                         let prefix = format!("{sender_nick}!{sender_nick}@matrix");
                         for piece in body.split('\n') {
                             if piece.is_empty() { continue; }
-                            send(&mut write, Message::with_prefix(&prefix, "PRIVMSG", vec![chan.clone(), piece.to_string()])).await?;
+                            send(&mut write, Message::with_prefix(&prefix, "PRIVMSG", vec![target.clone(), piece.to_string()])).await?;
                         }
                     }
                     Ok(FromMatrix::RoomAdded { room, chan, topic }) => {
                         if !registered {
-                            // will be picked up by auto_join_all on registration
                             continue;
                         }
                         if joined.contains(&chan) { continue; }
                         if let Some(n) = nick.as_deref() {
                             join_bridged(&mut write, n, &chan, &room, &topic, &bridge).await?;
                             joined.insert(chan);
+                        }
+                    }
+                    Ok(FromMatrix::DmAdded { nick: dm_nick }) => {
+                        if !registered { continue; }
+                        if let Some(n) = nick.as_deref() {
+                            matrirc_notice(&mut write, n, &format!("DM available: /msg {dm_nick} ...")).await?;
                         }
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
@@ -207,12 +219,22 @@ async fn join_bridged(
     topic: &str,
     bridge: &Bridge,
 ) -> Result<()> {
+    send_join_lines(write, nick, chan, topic).await?;
+    backfill_channel(write, chan, room, bridge).await?;
+    Ok(())
+}
+
+async fn send_join_lines(
+    write: &mut OwnedWriteHalf,
+    nick: &str,
+    chan: &str,
+    topic: &str,
+) -> Result<()> {
     let user_prefix = format!("{nick}!{nick}@matrirc.local");
     send(write, Message::with_prefix(&user_prefix, "JOIN", vec![chan.into()])).await?;
     send(write, srv("332", vec![nick.into(), chan.into(), topic.into()])).await?;
     send(write, srv("353", vec![nick.into(), "=".into(), chan.into(), format!("{nick} matrix")])).await?;
     send(write, srv("366", vec![nick.into(), chan.into(), "End of /NAMES list".into()])).await?;
-    backfill_channel(write, chan, room, bridge).await?;
     Ok(())
 }
 
@@ -223,13 +245,45 @@ async fn auto_join_all(
     joined: &mut HashSet<String>,
 ) -> Result<()> {
     let snapshot = bridge.snapshot();
-    for (chan, room) in snapshot {
-        if joined.contains(&chan) { continue; }
+    let dm_count = bridge.dm_count();
+    if snapshot.is_empty() && dm_count == 0 {
+        info!(%nick, "auto-join: no rooms mapped yet");
+        matrirc_notice(write, nick, "no Matrix rooms mapped yet; sync still in progress (channels will auto-join when ready)").await?;
+        return Ok(());
+    }
+    info!(%nick, channels = snapshot.len(), dms = dm_count, "auto-join: sending JOIN for all bridged rooms");
+    let mut new_joins = Vec::new();
+    for (chan, room) in &snapshot {
+        if joined.contains(chan) { continue; }
         let topic = format!("Matrix room {room}");
-        join_bridged(write, nick, &chan, &room, &topic, bridge).await?;
-        joined.insert(chan);
+        send_join_lines(write, nick, chan, &topic).await?;
+        joined.insert(chan.clone());
+        new_joins.push((chan.clone(), room.clone()));
+    }
+    let names: Vec<String> = new_joins.iter().map(|(c, _)| c.clone()).collect();
+    matrirc_notice(
+        write,
+        nick,
+        &format!(
+            "bridged {} channel(s) + {} DM(s). channels: {}",
+            names.len(),
+            dm_count,
+            if names.is_empty() { "(none)".into() } else { names.join(", ") }
+        ),
+    )
+    .await?;
+    for (chan, room) in new_joins {
+        backfill_channel(write, &chan, &room, bridge).await?;
     }
     Ok(())
+}
+
+async fn matrirc_notice(write: &mut OwnedWriteHalf, nick: &str, body: &str) -> Result<()> {
+    send(
+        write,
+        Message::with_prefix("matrirc!matrirc@matrirc.local", "NOTICE", vec![nick.into(), body.into()]),
+    )
+    .await
 }
 
 async fn backfill_channel(
@@ -315,6 +369,17 @@ async fn handle_privmsg(
         return Ok(());
     }
 
+    if let Some(room) = bridge.dm_room_for(target) {
+        if let Err(e) = bridge.to_matrix.try_send(ToMatrix::Send {
+            room,
+            body: text.clone(),
+        }) {
+            warn!("dropping outbound DM: {e}");
+            send(write, srv("NOTICE", vec![nick.into(), format!("DM send dropped: {e}")])).await?;
+        }
+        return Ok(());
+    }
+
     send(write, srv("401", vec![nick.into(), target.clone(), "No such nick/channel".into()])).await?;
     Ok(())
 }
@@ -342,7 +407,8 @@ async fn send_welcome(write: &mut OwnedWriteHalf, nick: &str) -> Result<()> {
     send(write, srv("003", vec![n.clone(), "This server has no creation date".into()])).await?;
     send(write, srv("004", vec![n.clone(), SERVER_NAME.into(), VERSION.into(), "".into(), "".into()])).await?;
     send(write, srv("375", vec![n.clone(), format!("- {SERVER_NAME} Message of the day -")])).await?;
-    send(write, srv("372", vec![n.clone(), format!("- matrirc step 2: try /join {ECHO_CHAN}")])).await?;
+    send(write, srv("372", vec![n.clone(), "- matrirc: Matrix rooms auto-joined after this line.".into()])).await?;
+    send(write, srv("372", vec![n.clone(), format!("- try also /join {ECHO_CHAN} for the local echo channel.")])).await?;
     send(write, srv("376", vec![n, "End of /MOTD command.".into()])).await?;
     Ok(())
 }

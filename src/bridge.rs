@@ -10,6 +10,8 @@ const RECENT_SENT_CAP: usize = 256;
 pub struct Mapping {
     pub room_to_chan: HashMap<OwnedRoomId, String>,
     pub chan_to_room: HashMap<String, OwnedRoomId>,
+    pub dm_room_to_nick: HashMap<OwnedRoomId, String>,
+    pub nick_to_dm_room: HashMap<String, OwnedRoomId>,
 }
 
 impl Mapping {
@@ -17,6 +19,13 @@ impl Mapping {
         let chan = chan.into();
         self.chan_to_room.insert(chan.clone(), room.clone());
         self.room_to_chan.insert(room, chan);
+    }
+
+    pub fn insert_dm(&mut self, room: OwnedRoomId, nick: impl Into<String>) {
+        let nick = nick.into();
+        let key = nick.to_ascii_lowercase();
+        self.nick_to_dm_room.insert(key, room.clone());
+        self.dm_room_to_nick.insert(room, nick);
     }
 }
 
@@ -44,6 +53,9 @@ pub enum FromMatrix {
         room: OwnedRoomId,
         chan: String,
         topic: String,
+    },
+    DmAdded {
+        nick: String,
     },
 }
 
@@ -97,8 +109,28 @@ impl Bridge {
         let _ = self.from_matrix.send(FromMatrix::RoomAdded { room, chan, topic });
     }
 
+    pub fn add_dm(&self, room: OwnedRoomId, nick: String) {
+        let mut m = self.mapping.write().unwrap();
+        m.insert_dm(room, nick.clone());
+        drop(m);
+        let _ = self.from_matrix.send(FromMatrix::DmAdded { nick });
+    }
+
     pub fn chan_for(&self, room: &RoomId) -> Option<String> {
         self.mapping.read().unwrap().room_to_chan.get(room).cloned()
+    }
+
+    pub fn dm_nick_for(&self, room: &RoomId) -> Option<String> {
+        self.mapping.read().unwrap().dm_room_to_nick.get(room).cloned()
+    }
+
+    pub fn dm_room_for(&self, nick: &str) -> Option<OwnedRoomId> {
+        self.mapping
+            .read()
+            .unwrap()
+            .nick_to_dm_room
+            .get(&nick.to_ascii_lowercase())
+            .cloned()
     }
 
     pub fn room_for(&self, chan: &str) -> Option<OwnedRoomId> {
@@ -106,10 +138,11 @@ impl Bridge {
     }
 
     pub fn has_room(&self, room: &RoomId) -> bool {
-        self.mapping.read().unwrap().room_to_chan.contains_key(room)
+        let m = self.mapping.read().unwrap();
+        m.room_to_chan.contains_key(room) || m.dm_room_to_nick.contains_key(room)
     }
 
-    /// Snapshot of all (chan, room, topic) for bulk auto-join.
+    /// Snapshot of all (chan, room) for bulk auto-join (channels only, no DMs).
     pub fn snapshot(&self) -> Vec<(String, OwnedRoomId)> {
         self.mapping
             .read()
@@ -118,6 +151,11 @@ impl Bridge {
             .iter()
             .map(|(c, r)| (c.clone(), r.clone()))
             .collect()
+    }
+
+    /// Snapshot of DM count for summary messages.
+    pub fn dm_count(&self) -> usize {
+        self.mapping.read().unwrap().dm_room_to_nick.len()
     }
 
     pub fn note_sent_by_us(&self, id: OwnedEventId) {

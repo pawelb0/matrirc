@@ -12,7 +12,7 @@ use matrix_sdk::ruma::events::{
     AnySyncMessageLikeEvent, AnySyncTimelineEvent, SyncMessageLikeEvent,
 };
 use matrix_sdk::store::RoomLoadSettings;
-use matrix_sdk::{Client, Room, RoomState, SessionMeta, SessionTokens};
+use matrix_sdk::{Client, Room, RoomMemberships, RoomState, SessionMeta, SessionTokens};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -62,6 +62,20 @@ pub async fn discover_homeserver(http: &reqwest::Client, server_name: &str) -> R
         }
     }
     Ok(format!("https://{server_name}"))
+}
+
+async fn dm_peer_nick(client: &Client, room: &Room) -> Option<String> {
+    let me = client.user_id()?;
+    let members = room
+        .members(RoomMemberships::JOIN | RoomMemberships::INVITE)
+        .await
+        .ok()?;
+    for m in members {
+        if m.user_id() != me {
+            return Some(mxid_localpart(m.user_id().as_str()).to_string());
+        }
+    }
+    None
 }
 
 async fn backfill(client: &Client, room_id: &matrix_sdk::ruma::RoomId, limit: u32) -> Vec<BackfillMessage> {
@@ -171,6 +185,16 @@ pub async fn run_sync(
             }
         }
 
+        if room.is_direct().await.unwrap_or(false) {
+            match dm_peer_nick(&client, &room).await {
+                Some(nick) => {
+                    bridge.add_dm(room.room_id().to_owned(), nick);
+                }
+                None => warn!("DM room {} has no identifiable peer", room.room_id()),
+            }
+            continue;
+        }
+
         let preferred = preferred_channel_name(room.room_id(), Some(&name));
         let chan = match name_store.assign_or_get(room.room_id(), &preferred) {
             Ok(c) => c,
@@ -184,8 +208,9 @@ pub async fn run_sync(
     }
 
     info!(
-        "matrix: {} room(s) bridged",
-        bridge.snapshot().len()
+        channels = bridge.snapshot().len(),
+        dms = bridge.dm_count(),
+        "matrix: bridge populated"
     );
     info!("matrix: starting incremental sync loop");
 
