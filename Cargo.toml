@@ -16,7 +16,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
-matrix-sdk = { version = "=0.14", default-features = false, features = ["rustls-tls", "sqlite"] }
+matrix-sdk = { version = "=0.14", default-features = false, features = ["rustls-tls", "sqlite", "e2e-encryption"] }
 
 [dev-dependencies]
 tempfile = "3"

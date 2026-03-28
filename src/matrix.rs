@@ -108,6 +108,58 @@ async fn backfill(client: &Client, room_id: &matrix_sdk::ruma::RoomId, limit: u3
     out
 }
 
+async fn build_client_restored(cfg: &Config) -> Result<Client> {
+    let store = store_path()?;
+    std::fs::create_dir_all(&store).with_context(|| format!("create {}", store.display()))?;
+    let client = Client::builder()
+        .homeserver_url(&cfg.homeserver_url)
+        .sqlite_store(&store, None)
+        .build()
+        .await
+        .context("build matrix client")?;
+    let user_id = matrix_sdk::ruma::OwnedUserId::try_from(cfg.mxid.as_str())
+        .with_context(|| format!("parse mxid {}", cfg.mxid))?;
+    let device_id = matrix_sdk::ruma::OwnedDeviceId::from(cfg.device_id.as_str());
+    let session = MatrixSession {
+        meta: SessionMeta { user_id, device_id },
+        tokens: SessionTokens {
+            access_token: cfg.access_token.clone(),
+            refresh_token: None,
+        },
+    };
+    client
+        .matrix_auth()
+        .restore_session(session, RoomLoadSettings::default())
+        .await
+        .context("restore session")?;
+    Ok(client)
+}
+
+pub async fn bootstrap_e2ee(recovery_key: String) -> Result<()> {
+    let cfg_path = crate::config::config_path()?;
+    let cfg = Config::load(&cfg_path)
+        .with_context(|| format!("load config {}", cfg_path.display()))?;
+    info!("bootstrap-e2ee: building client");
+    let client = build_client_restored(&cfg).await?;
+    info!("bootstrap-e2ee: running initial sync so the olm machine is ready");
+    client
+        .sync_once(SyncSettings::default())
+        .await
+        .context("initial sync")?;
+    info!("bootstrap-e2ee: calling recovery().recover()");
+    client
+        .encryption()
+        .recovery()
+        .recover(recovery_key.as_str())
+        .await
+        .context("recover with recovery key")?;
+    // scrub the key from memory best-effort
+    drop(recovery_key);
+    println!("E2EE bootstrap complete. Secrets imported and device ready to decrypt.");
+    println!("Restart the daemon to pick up the new crypto state.");
+    Ok(())
+}
+
 pub fn store_path() -> Result<PathBuf> {
     if let Some(dir) = std::env::var_os("XDG_DATA_HOME") {
         return Ok(PathBuf::from(dir).join("matrirc").join("store"));

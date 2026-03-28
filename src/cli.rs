@@ -38,6 +38,11 @@ pub enum Command {
         #[arg(long)]
         homeserver: Option<String>,
     },
+    /// One-shot import of cross-signing + message backup key using a Secure Secret
+    /// Storage recovery key. Required once per fresh crypto store so E2EE rooms decrypt.
+    /// Key is read from MATRIRC_RECOVERY_KEY env var, or piped on stdin. The key is
+    /// not persisted by matrirc anywhere.
+    BootstrapE2ee,
 }
 
 pub async fn login(mxid: &str, homeserver_override: Option<&str>) -> Result<()> {
@@ -79,7 +84,15 @@ pub async fn login(mxid: &str, homeserver_override: Option<&str>) -> Result<()> 
 }
 
 fn read_token() -> Result<String> {
-    if let Ok(t) = std::env::var("MATRIRC_TOKEN") {
+    read_secret("MATRIRC_TOKEN", "token")
+}
+
+pub fn read_recovery_key() -> Result<String> {
+    read_secret("MATRIRC_RECOVERY_KEY", "recovery key")
+}
+
+fn read_secret(env: &str, label: &str) -> Result<String> {
+    if let Ok(t) = std::env::var(env) {
         let t = t.trim().to_string();
         if !t.is_empty() {
             return Ok(t);
@@ -88,14 +101,14 @@ fn read_token() -> Result<String> {
     use std::io::IsTerminal;
     if std::io::stdin().is_terminal() {
         return Err(anyhow!(
-            "no token: set MATRIRC_TOKEN or pipe the token on stdin"
+            "no {label}: set {env} or pipe the {label} on stdin"
         ));
     }
     let mut buf = String::new();
     std::io::stdin().read_to_string(&mut buf).context("read stdin")?;
     let t = buf.trim().to_string();
     if t.is_empty() {
-        return Err(anyhow!("empty token on stdin"));
+        return Err(anyhow!("empty {label} on stdin"));
     }
     Ok(t)
 }
