@@ -5,6 +5,7 @@ use anyhow::{anyhow, Context, Result};
 use matrix_sdk::authentication::matrix::MatrixSession;
 use matrix_sdk::config::SyncSettings;
 use matrix_sdk::room::MessagesOptions;
+use matrix_sdk::ruma::events::room::encrypted::SyncRoomEncryptedEvent;
 use matrix_sdk::ruma::events::room::message::{
     MessageType, RoomMessageEventContent, SyncRoomMessageEvent,
 };
@@ -12,7 +13,7 @@ use matrix_sdk::ruma::events::{
     AnySyncMessageLikeEvent, AnySyncTimelineEvent, SyncMessageLikeEvent,
 };
 use matrix_sdk::store::RoomLoadSettings;
-use matrix_sdk::{Client, Room, RoomMemberships, RoomState, SessionMeta, SessionTokens};
+use matrix_sdk::{Client, EncryptionState, Room, RoomMemberships, RoomState, SessionMeta, SessionTokens};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -80,30 +81,71 @@ async fn dm_peer_nick(client: &Client, room: &Room) -> Option<String> {
 
 async fn backfill(client: &Client, room_id: &matrix_sdk::ruma::RoomId, limit: u32) -> Vec<BackfillMessage> {
     let Some(room) = client.get_room(room_id) else { return Vec::new(); };
-    let mut opts = MessagesOptions::backward();
-    opts.limit = limit.into();
-    let msgs = match room.messages(opts).await {
-        Ok(m) => m,
-        Err(e) => {
-            warn!("backfill {room_id} failed: {e}");
-            return Vec::new();
+    if matches!(room.encryption_state(), EncryptionState::Encrypted) {
+        // Pre-fetch megolm keys from server backup so history decrypts. Silent on
+        // failure (no backup yet, or network hiccup).
+        if let Err(e) = client
+            .encryption()
+            .backups()
+            .download_room_keys_for_room(room_id)
+            .await
+        {
+            tracing::debug!(room = %room_id, "key backup download skipped: {e}");
         }
-    };
-    let mut out = Vec::new();
-    for ev in msgs.chunk.iter().rev() {
-        let Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
-            SyncMessageLikeEvent::Original(orig),
-        ))) = ev.raw().deserialize() else { continue; };
-        let body = match &orig.content.msgtype {
-            MessageType::Text(t) => t.body.clone(),
-            MessageType::Notice(t) => t.body.clone(),
-            MessageType::Emote(t) => format!("\x01ACTION {}\x01", t.body),
-            _ => continue,
+    }
+    let mut collected = Vec::<matrix_sdk::deserialized_responses::TimelineEvent>::new();
+    let mut next_token: Option<String> = None;
+    while collected.len() < limit as usize {
+        let mut opts = MessagesOptions::backward();
+        let want = std::cmp::min(limit as usize - collected.len(), 100) as u32;
+        opts.limit = want.into();
+        if let Some(t) = &next_token {
+            opts = opts.from(t.as_str());
+        }
+        let page = match room.messages(opts).await {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("backfill {room_id} page failed: {e}");
+                break;
+            }
         };
-        out.push(BackfillMessage {
-            sender_nick: mxid_localpart(orig.sender.as_str()).to_string(),
-            body,
-        });
+        if page.chunk.is_empty() {
+            break;
+        }
+        collected.extend(page.chunk);
+        match page.end {
+            Some(t) => next_token = Some(t),
+            None => break,
+        }
+    }
+    let mut out = Vec::new();
+    for ev in collected.iter().rev() {
+        let Ok(parsed) = ev.raw().deserialize() else { continue; };
+        match parsed {
+            AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
+                SyncMessageLikeEvent::Original(orig),
+            )) => {
+                let body = match &orig.content.msgtype {
+                    MessageType::Text(t) => t.body.clone(),
+                    MessageType::Notice(t) => t.body.clone(),
+                    MessageType::Emote(t) => format!("\x01ACTION {}\x01", t.body),
+                    _ => continue,
+                };
+                out.push(BackfillMessage {
+                    sender_nick: mxid_localpart(orig.sender.as_str()).to_string(),
+                    body,
+                });
+            }
+            AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomEncrypted(
+                SyncMessageLikeEvent::Original(orig),
+            )) => {
+                out.push(BackfillMessage {
+                    sender_nick: mxid_localpart(orig.sender.as_str()).to_string(),
+                    body: "[encrypted — run `matrirc bootstrap-e2ee` to decrypt]".into(),
+                });
+            }
+            _ => continue,
+        }
     }
     out
 }
@@ -153,9 +195,9 @@ pub async fn bootstrap_e2ee(recovery_key: String) -> Result<()> {
         .recover(recovery_key.as_str())
         .await
         .context("recover with recovery key")?;
-    // scrub the key from memory best-effort
     drop(recovery_key);
-    println!("E2EE bootstrap complete. Secrets imported and device ready to decrypt.");
+    println!("E2EE bootstrap complete. Cross-signing + backup secrets imported.");
+    println!("Megolm message keys are fetched lazily the first time you /join a channel.");
     println!("Restart the daemon to pick up the new crypto state.");
     Ok(())
 }
@@ -266,6 +308,24 @@ pub async fn run_sync(
     );
     info!("matrix: starting incremental sync loop");
 
+    // Fallback for events the SDK could not decrypt: emit a visible placeholder so
+    // users see "something was said" instead of silence.
+    let bridge_for_utd = bridge.clone();
+    client.add_event_handler(move |ev: SyncRoomEncryptedEvent, room: Room| {
+        let bridge = bridge_for_utd.clone();
+        async move {
+            if !bridge.has_room(room.room_id()) { return; }
+            let Some(orig) = ev.as_original() else { return; };
+            if bridge.take_if_sent_by_us(&orig.event_id) { return; }
+            let nick = mxid_localpart(orig.sender.as_str()).to_string();
+            let _ = bridge.from_matrix.send(FromMatrix::Message {
+                room: room.room_id().to_owned(),
+                sender_nick: nick,
+                body: "[encrypted — run `matrirc bootstrap-e2ee` once to decrypt]".into(),
+            });
+        }
+    });
+
     let bridge_for_handler = bridge.clone();
     client.add_event_handler(move |ev: SyncRoomMessageEvent, room: Room| {
         let bridge = bridge_for_handler.clone();
@@ -301,10 +361,21 @@ pub async fn run_sync(
             match cmd {
                 ToMatrix::Send { room, body } => match send_client.get_room(&room) {
                     Some(r) => {
+                        info!(%room, bytes = body.len(), encrypted = ?r.encryption_state(), "matrix: sending");
                         let content = RoomMessageEventContent::text_plain(&body);
                         match r.send(content).await {
-                            Ok(resp) => send_bridge.note_sent_by_us(resp.event_id),
-                            Err(e) => warn!("matrix send to {room} failed: {e}"),
+                            Ok(resp) => {
+                                info!(%room, event = %resp.event_id, "matrix: sent");
+                                send_bridge.note_sent_by_us(resp.event_id);
+                            }
+                            Err(e) => {
+                                warn!(%room, "matrix send failed: {e:#}");
+                                let _ = send_bridge.from_matrix.send(FromMatrix::Message {
+                                    room: room.clone(),
+                                    sender_nick: "matrirc".into(),
+                                    body: format!("[send failed: {e}]"),
+                                });
+                            }
                         }
                     }
                     None => warn!("matrix room not found: {room}"),

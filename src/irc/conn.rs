@@ -297,7 +297,7 @@ async fn backfill_channel(
         .to_matrix
         .try_send(ToMatrix::Backfill {
             room: room.to_owned(),
-            limit: 20,
+            limit: 200,
             reply: tx,
         })
         .is_err()

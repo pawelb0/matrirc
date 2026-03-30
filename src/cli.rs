@@ -43,6 +43,14 @@ pub enum Command {
     /// Key is read from MATRIRC_RECOVERY_KEY env var, or piped on stdin. The key is
     /// not persisted by matrirc anywhere.
     BootstrapE2ee,
+    /// Wipe local matrirc state (config, crypto store, name store) so the next
+    /// login creates a fresh device. Does NOT sign the device out on the
+    /// homeserver — do that in Element → Settings → Sessions.
+    Reset {
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 pub async fn login(mxid: &str, homeserver_override: Option<&str>) -> Result<()> {
@@ -111,6 +119,53 @@ fn read_secret(env: &str, label: &str) -> Result<String> {
         return Err(anyhow!("empty {label} on stdin"));
     }
     Ok(t)
+}
+
+pub fn reset(force: bool) -> Result<()> {
+    use std::io::Write;
+    let paths = [
+        crate::config::config_path()?,
+        crate::matrix::store_path()?,
+        crate::names::default_store_path()?,
+    ];
+
+    eprintln!("matrirc reset will remove:");
+    for p in &paths {
+        eprintln!("  {}", p.display());
+    }
+    eprintln!();
+
+    if !force {
+        eprint!("proceed? [y/N] ");
+        std::io::stderr().flush().ok();
+        let mut buf = String::new();
+        std::io::stdin().read_line(&mut buf).context("read stdin")?;
+        if !buf.trim().eq_ignore_ascii_case("y") {
+            eprintln!("aborted");
+            return Ok(());
+        }
+    }
+
+    for p in &paths {
+        if p.is_dir() {
+            std::fs::remove_dir_all(p)
+                .with_context(|| format!("remove dir {}", p.display()))?;
+            println!("removed dir {}", p.display());
+        } else if p.exists() {
+            std::fs::remove_file(p)
+                .with_context(|| format!("remove {}", p.display()))?;
+            println!("removed {}", p.display());
+        }
+    }
+
+    println!();
+    println!("next steps:");
+    println!("  1. Element → Settings → Sessions → sign out the old matrirc device.");
+    println!("  2. Create a fresh access token (same screen).");
+    println!("  3. matrirc login @you:server.org  (token via MATRIRC_TOKEN or stdin)");
+    println!("  4. matrirc bootstrap-e2ee         (for E2EE room history)");
+    println!("  5. matrirc run");
+    Ok(())
 }
 
 pub fn install_irssi(force: bool, dry_run: bool) -> Result<()> {
