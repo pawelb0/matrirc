@@ -196,7 +196,17 @@ pub async fn bootstrap_e2ee(recovery_key: String) -> Result<()> {
         .await
         .context("recover with recovery key")?;
     drop(recovery_key);
-    println!("E2EE bootstrap complete. Cross-signing + backup secrets imported.");
+
+    info!("bootstrap-e2ee: self-signing this device with the imported self-signing key");
+    match client.encryption().get_own_device().await.context("get own device")? {
+        Some(device) => match device.verify().await {
+            Ok(()) => info!("bootstrap-e2ee: device signed + marked verified"),
+            Err(e) => warn!("self-sign failed (other clients may refuse key share): {e}"),
+        },
+        None => warn!("own device not found in crypto store"),
+    }
+
+    println!("E2EE bootstrap complete. Cross-signing + backup secrets imported, device self-signed.");
     println!("Megolm message keys are fetched lazily the first time you /join a channel.");
     println!("Restart the daemon to pick up the new crypto state.");
     Ok(())
