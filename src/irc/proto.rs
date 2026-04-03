@@ -10,6 +10,7 @@ pub enum ProtoError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {
+    pub tags: Vec<(String, String)>,
     pub prefix: Option<String>,
     pub command: String,
     pub params: Vec<String>,
@@ -18,11 +19,16 @@ pub struct Message {
 impl Message {
     #[allow(dead_code)] // used in Step 2+ for client-bound messages without server prefix
     pub fn new(command: impl Into<String>, params: Vec<String>) -> Self {
-        Self { prefix: None, command: command.into(), params }
+        Self { tags: Vec::new(), prefix: None, command: command.into(), params }
     }
 
     pub fn with_prefix(prefix: impl Into<String>, command: impl Into<String>, params: Vec<String>) -> Self {
-        Self { prefix: Some(prefix.into()), command: command.into(), params }
+        Self { tags: Vec::new(), prefix: Some(prefix.into()), command: command.into(), params }
+    }
+
+    pub fn with_tag(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.tags.push((key.into(), value.into()));
+        self
     }
 
     pub fn parse(line: &str) -> Result<Self, ProtoError> {
@@ -32,6 +38,14 @@ impl Message {
         }
 
         let mut rest = line;
+        let tags = if let Some(stripped) = rest.strip_prefix('@') {
+            let (tag_section, r) = split_once_space(stripped);
+            rest = r.trim_start_matches(' ');
+            parse_tags(tag_section)
+        } else {
+            Vec::new()
+        };
+
         let prefix = if let Some(stripped) = rest.strip_prefix(':') {
             let (p, r) = split_once_space(stripped);
             rest = r.trim_start_matches(' ');
@@ -61,12 +75,26 @@ impl Message {
             rest = r;
         }
 
-        Ok(Self { prefix, command, params })
+        Ok(Self { tags, prefix, command, params })
     }
 
     /// Serialize to wire format (without trailing CRLF).
     pub fn to_wire(&self) -> String {
         let mut out = String::new();
+        if !self.tags.is_empty() {
+            out.push('@');
+            for (i, (k, v)) in self.tags.iter().enumerate() {
+                if i > 0 {
+                    out.push(';');
+                }
+                out.push_str(k);
+                if !v.is_empty() {
+                    out.push('=');
+                    out.push_str(&escape_tag_value(v));
+                }
+            }
+            out.push(' ');
+        }
         if let Some(p) = &self.prefix {
             out.push(':');
             out.push_str(p);
@@ -91,6 +119,53 @@ fn split_once_space(s: &str) -> (&str, &str) {
         Some(i) => (&s[..i], &s[i + 1..]),
         None => (s, ""),
     }
+}
+
+fn parse_tags(section: &str) -> Vec<(String, String)> {
+    section
+        .split(';')
+        .filter(|p| !p.is_empty())
+        .map(|p| match p.split_once('=') {
+            Some((k, v)) => (k.to_string(), unescape_tag_value(v)),
+            None => (p.to_string(), String::new()),
+        })
+        .collect()
+}
+
+fn escape_tag_value(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    for c in v.chars() {
+        match c {
+            ';' => out.push_str("\\:"),
+            ' ' => out.push_str("\\s"),
+            '\\' => out.push_str("\\\\"),
+            '\r' => out.push_str("\\r"),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn unescape_tag_value(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    let mut chars = v.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some(':') => out.push(';'),
+                Some('s') => out.push(' '),
+                Some('\\') => out.push('\\'),
+                Some('r') => out.push('\r'),
+                Some('n') => out.push('\n'),
+                Some(c) => out.push(c),
+                None => {}
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -238,6 +313,54 @@ mod tests {
         let wire = m.to_wire();
         let parsed = Message::parse(&wire).unwrap();
         assert_eq!(parsed, m);
+    }
+
+    #[test]
+    fn parse_tags_basic() {
+        let m = Message::parse("@time=2024-03-14T12:34:56.789Z :nick!u@h PRIVMSG #c :hi").unwrap();
+        assert_eq!(m.tags, vec![("time".into(), "2024-03-14T12:34:56.789Z".into())]);
+        assert_eq!(m.prefix.as_deref(), Some("nick!u@h"));
+        assert_eq!(m.command, "PRIVMSG");
+        assert_eq!(m.params, vec!["#c".to_string(), "hi".to_string()]);
+    }
+
+    #[test]
+    fn parse_multiple_tags_and_unescape() {
+        let m = Message::parse("@a=one;b=two\\sthree;c PING :x").unwrap();
+        assert_eq!(
+            m.tags,
+            vec![
+                ("a".into(), "one".into()),
+                ("b".into(), "two three".into()),
+                ("c".into(), String::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn serialize_tag_with_server_time() {
+        let m = Message::with_prefix("nick!u@h", "PRIVMSG", vec!["#c".into(), "hi".into()])
+            .with_tag("time", "2024-03-14T12:34:56.789Z");
+        assert_eq!(
+            m.to_wire(),
+            "@time=2024-03-14T12:34:56.789Z :nick!u@h PRIVMSG #c hi"
+        );
+    }
+
+    #[test]
+    fn serialize_tag_escapes_space_and_semicolon() {
+        let m = Message::new("PING", vec!["x".into()]).with_tag("k", "a b;c");
+        assert_eq!(m.to_wire(), "@k=a\\sb\\:c PING x");
+    }
+
+    #[test]
+    fn round_trip_tag() {
+        let original = Message::with_prefix("x", "PRIVMSG", vec!["#c".into(), "body space".into()])
+            .with_tag("time", "2024-01-01T00:00:00Z")
+            .with_tag("msgid", "abc;123");
+        let wire = original.to_wire();
+        let parsed = Message::parse(&wire).unwrap();
+        assert_eq!(parsed, original);
     }
 
     #[test]

@@ -76,6 +76,7 @@ pub enum ToMatrix {
 pub struct BackfillMessage {
     pub sender_nick: String,
     pub body: String,
+    pub origin_ms: i64,
 }
 
 #[derive(Clone)]

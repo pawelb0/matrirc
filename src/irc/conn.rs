@@ -2,6 +2,9 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
+use time::format_description::FormatItem;
+use time::macros::format_description;
+use time::OffsetDateTime;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::TcpStream;
@@ -10,6 +13,13 @@ use tracing::{debug, info, warn};
 
 use super::proto::Message;
 use crate::bridge::{Bridge, FromMatrix, ToMatrix};
+
+const ISO_FMT: &[FormatItem<'static>] = format_description!(
+    "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
+);
+const SERVER_TIME_CAP: &str = "server-time";
+const MESSAGE_TAGS_CAP: &str = "message-tags";
+const SUPPORTED_CAPS: &[&str] = &[SERVER_TIME_CAP, MESSAGE_TAGS_CAP];
 
 const SERVER_NAME: &str = "matrirc.local";
 const VERSION: &str = concat!("matrirc-", env!("CARGO_PKG_VERSION"));
@@ -29,6 +39,7 @@ pub async fn handle(sock: TcpStream, peer: SocketAddr, bridge: Bridge) -> Result
     let mut user: Option<String> = None;
     let mut registered = false;
     let mut joined: HashSet<String> = HashSet::new();
+    let mut caps_enabled: HashSet<String> = HashSet::new();
 
     loop {
         tokio::select! {
@@ -41,14 +52,14 @@ pub async fn handle(sock: TcpStream, peer: SocketAddr, bridge: Bridge) -> Result
                         continue;
                     }
                 };
-                if handle_command(&mut write, &peer, &bridge, &msg, &mut nick, &mut user, &mut joined).await? {
+                if handle_command(&mut write, &peer, &bridge, &msg, &mut nick, &mut user, &mut joined, &mut caps_enabled).await? {
                     return Ok(());
                 }
                 if !registered {
                     if let (Some(n), Some(_)) = (&nick, &user) {
                         send_welcome(&mut write, n).await?;
                         registered = true;
-                        auto_join_all(&mut write, n, &bridge, &mut joined).await?;
+                        auto_join_all(&mut write, n, &bridge, &mut joined, &caps_enabled).await?;
                     }
                 }
             }
@@ -76,7 +87,7 @@ pub async fn handle(sock: TcpStream, peer: SocketAddr, bridge: Bridge) -> Result
                         }
                         if joined.contains(&chan) { continue; }
                         if let Some(n) = nick.as_deref() {
-                            join_bridged(&mut write, n, &chan, &room, &topic, &bridge).await?;
+                            join_bridged(&mut write, n, &chan, &room, &topic, &bridge, &caps_enabled).await?;
                             joined.insert(chan);
                         }
                     }
@@ -108,9 +119,10 @@ async fn handle_command(
     nick: &mut Option<String>,
     user: &mut Option<String>,
     joined: &mut HashSet<String>,
+    caps_enabled: &mut HashSet<String>,
 ) -> Result<bool> {
     match msg.command.as_str() {
-        "CAP" => handle_cap(write, msg).await?,
+        "CAP" => handle_cap(write, msg, caps_enabled).await?,
         "NICK" => {
             if let Some(n) = msg.params.first() {
                 *nick = Some(n.clone());
@@ -127,7 +139,7 @@ async fn handle_command(
         }
         "JOIN" => {
             if let Some(n) = nick.as_deref() {
-                handle_join(write, n, msg, joined, bridge).await?;
+                handle_join(write, n, msg, joined, bridge, caps_enabled).await?;
             }
         }
         "PART" => {
@@ -151,18 +163,46 @@ async fn handle_command(
     Ok(false)
 }
 
-async fn handle_cap(write: &mut OwnedWriteHalf, msg: &Message) -> Result<()> {
+async fn handle_cap(
+    write: &mut OwnedWriteHalf,
+    msg: &Message,
+    caps_enabled: &mut HashSet<String>,
+) -> Result<()> {
     match msg.params.first().map(String::as_str) {
         Some("LS") => {
-            send(write, srv("CAP", vec!["*".into(), "LS".into(), "".into()])).await?;
+            let advertised = SUPPORTED_CAPS.join(" ");
+            send(write, srv("CAP", vec!["*".into(), "LS".into(), advertised])).await?;
         }
         Some("END") => {}
         Some("LIST") => {
-            send(write, srv("CAP", vec!["*".into(), "LIST".into(), "".into()])).await?;
+            let active: Vec<&str> = caps_enabled.iter().map(String::as_str).collect();
+            send(
+                write,
+                srv("CAP", vec!["*".into(), "LIST".into(), active.join(" ")]),
+            )
+            .await?;
         }
         Some("REQ") => {
             let requested = msg.params.get(1).cloned().unwrap_or_default();
-            send(write, srv("CAP", vec!["*".into(), "NAK".into(), requested])).await?;
+            let caps: Vec<&str> = requested.split_whitespace().collect();
+            let all_supported = caps.iter().all(|c| {
+                SUPPORTED_CAPS.contains(c) || SUPPORTED_CAPS.contains(&c.trim_start_matches('-'))
+            });
+            let verb = if all_supported { "ACK" } else { "NAK" };
+            if all_supported {
+                for c in &caps {
+                    if let Some(removed) = c.strip_prefix('-') {
+                        caps_enabled.remove(removed);
+                    } else {
+                        caps_enabled.insert((*c).to_string());
+                    }
+                }
+            }
+            send(
+                write,
+                srv("CAP", vec!["*".into(), verb.into(), requested]),
+            )
+            .await?;
         }
         _ => debug!(?msg, "ignoring CAP subcommand"),
     }
@@ -175,6 +215,7 @@ async fn handle_join(
     msg: &Message,
     joined: &mut HashSet<String>,
     bridge: &Bridge,
+    caps: &HashSet<String>,
 ) -> Result<()> {
     let Some(target) = msg.params.first() else { return Ok(()); };
     for chan in target.split(',') {
@@ -188,7 +229,7 @@ async fn handle_join(
         }
         if let Some(room) = bridge.room_for(chan) {
             let topic = format!("Matrix room {room}");
-            join_bridged(write, nick, chan, &room, &topic, bridge).await?;
+            join_bridged(write, nick, chan, &room, &topic, bridge, caps).await?;
             joined.insert(chan.to_string());
             continue;
         }
@@ -218,9 +259,10 @@ async fn join_bridged(
     room: &matrix_sdk::ruma::RoomId,
     topic: &str,
     bridge: &Bridge,
+    caps: &HashSet<String>,
 ) -> Result<()> {
     send_join_lines(write, nick, chan, topic).await?;
-    backfill_channel(write, chan, room, bridge).await?;
+    backfill_channel(write, chan, room, bridge, caps).await?;
     Ok(())
 }
 
@@ -243,6 +285,7 @@ async fn auto_join_all(
     nick: &str,
     bridge: &Bridge,
     joined: &mut HashSet<String>,
+    caps: &HashSet<String>,
 ) -> Result<()> {
     let snapshot = bridge.snapshot();
     let dm_count = bridge.dm_count();
@@ -273,7 +316,7 @@ async fn auto_join_all(
     )
     .await?;
     for (chan, room) in new_joins {
-        backfill_channel(write, &chan, &room, bridge).await?;
+        backfill_channel(write, &chan, &room, bridge, caps).await?;
     }
     Ok(())
 }
@@ -291,6 +334,7 @@ async fn backfill_channel(
     chan: &str,
     room: &matrix_sdk::ruma::RoomId,
     bridge: &Bridge,
+    caps: &HashSet<String>,
 ) -> Result<()> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     if bridge
@@ -309,14 +353,29 @@ async fn backfill_channel(
         Ok(m) => m,
         Err(_) => return Ok(()),
     };
+    let server_time = caps.contains(SERVER_TIME_CAP);
     for m in msgs {
         let prefix = format!("{}!{0}@matrix", m.sender_nick);
         for piece in m.body.split('\n') {
             if piece.is_empty() { continue; }
-            send(write, Message::with_prefix(&prefix, "PRIVMSG", vec![chan.into(), piece.into()])).await?;
+            let mut out = Message::with_prefix(&prefix, "PRIVMSG", vec![chan.into(), piece.into()]);
+            if server_time {
+                if let Some(iso) = ms_to_iso(m.origin_ms) {
+                    out = out.with_tag("time", iso);
+                }
+            }
+            send(write, out).await?;
         }
     }
     Ok(())
+}
+
+fn ms_to_iso(ms: i64) -> Option<String> {
+    let nanos = i128::from(ms).checked_mul(1_000_000)?;
+    OffsetDateTime::from_unix_timestamp_nanos(nanos)
+        .ok()?
+        .format(ISO_FMT)
+        .ok()
 }
 
 async fn handle_part(

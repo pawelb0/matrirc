@@ -134,6 +134,7 @@ async fn backfill(client: &Client, room_id: &matrix_sdk::ruma::RoomId, limit: u3
                 out.push(BackfillMessage {
                     sender_nick: mxid_localpart(orig.sender.as_str()).to_string(),
                     body,
+                    origin_ms: orig.origin_server_ts.0.into(),
                 });
             }
             AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomEncrypted(
@@ -142,6 +143,7 @@ async fn backfill(client: &Client, room_id: &matrix_sdk::ruma::RoomId, limit: u3
                 out.push(BackfillMessage {
                     sender_nick: mxid_localpart(orig.sender.as_str()).to_string(),
                     body: "[encrypted — run `matrirc bootstrap-e2ee` to decrypt]".into(),
+                    origin_ms: orig.origin_server_ts.0.into(),
                 });
             }
             _ => continue,
@@ -293,6 +295,20 @@ pub async fn run_sync(
             match dm_peer_nick(&client, &room).await {
                 Some(nick) => {
                     bridge.add_dm(room.room_id().to_owned(), nick);
+                    if matches!(room.encryption_state(), EncryptionState::Encrypted) {
+                        let c = client.clone();
+                        let rid = room.room_id().to_owned();
+                        tokio::spawn(async move {
+                            if let Err(e) = c
+                                .encryption()
+                                .backups()
+                                .download_room_keys_for_room(&rid)
+                                .await
+                            {
+                                tracing::debug!(room = %rid, "DM key download failed: {e}");
+                            }
+                        });
+                    }
                 }
                 None => warn!("DM room {} has no identifiable peer", room.room_id()),
             }
