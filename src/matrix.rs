@@ -7,7 +7,7 @@ use matrix_sdk::config::SyncSettings;
 use matrix_sdk::room::MessagesOptions;
 use matrix_sdk::ruma::events::room::encrypted::SyncRoomEncryptedEvent;
 use matrix_sdk::ruma::events::room::message::{
-    MessageType, RoomMessageEventContent, SyncRoomMessageEvent,
+    MessageType, Relation, RoomMessageEventContent, SyncRoomMessageEvent,
 };
 use matrix_sdk::ruma::events::{
     AnySyncMessageLikeEvent, AnySyncTimelineEvent, SyncMessageLikeEvent,
@@ -63,6 +63,24 @@ pub async fn discover_homeserver(http: &reqwest::Client, server_name: &str) -> R
         }
     }
     Ok(format!("https://{server_name}"))
+}
+
+fn body_from_event(content: &RoomMessageEventContent) -> Option<String> {
+    if let Some(Relation::Replacement(repl)) = &content.relates_to {
+        let new_body = match &repl.new_content.msgtype {
+            MessageType::Text(t) => t.body.clone(),
+            MessageType::Notice(t) => t.body.clone(),
+            MessageType::Emote(t) => t.body.clone(),
+            _ => return None,
+        };
+        return Some(format!("* edit: {new_body}"));
+    }
+    match &content.msgtype {
+        MessageType::Text(t) => Some(t.body.clone()),
+        MessageType::Notice(t) => Some(t.body.clone()),
+        MessageType::Emote(t) => Some(format!("\x01ACTION {}\x01", t.body)),
+        _ => None,
+    }
 }
 
 async fn dm_peer_nick(client: &Client, room: &Room) -> Option<String> {
@@ -125,12 +143,7 @@ async fn backfill(client: &Client, room_id: &matrix_sdk::ruma::RoomId, limit: u3
             AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
                 SyncMessageLikeEvent::Original(orig),
             )) => {
-                let body = match &orig.content.msgtype {
-                    MessageType::Text(t) => t.body.clone(),
-                    MessageType::Notice(t) => t.body.clone(),
-                    MessageType::Emote(t) => format!("\x01ACTION {}\x01", t.body),
-                    _ => continue,
-                };
+                let Some(body) = body_from_event(&orig.content) else { continue; };
                 out.push(BackfillMessage {
                     sender_nick: mxid_localpart(orig.sender.as_str()).to_string(),
                     body,
@@ -365,11 +378,9 @@ pub async fn run_sync(
             if bridge.take_if_sent_by_us(&orig.event_id) {
                 return;
             }
-            let body = match &orig.content.msgtype {
-                MessageType::Text(t) => t.body.clone(),
-                MessageType::Notice(t) => t.body.clone(),
-                MessageType::Emote(t) => format!("\x01ACTION {}\x01", t.body),
-                _ => return,
+            let body = match body_from_event(&orig.content) {
+                Some(b) => b,
+                None => return,
             };
             let nick = mxid_localpart(orig.sender.as_str()).to_string();
             let _ = bridge.from_matrix.send(FromMatrix::Message {
