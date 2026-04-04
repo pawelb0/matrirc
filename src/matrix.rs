@@ -5,6 +5,7 @@ use anyhow::{anyhow, Context, Result};
 use matrix_sdk::authentication::matrix::MatrixSession;
 use matrix_sdk::config::SyncSettings;
 use matrix_sdk::room::MessagesOptions;
+use matrix_sdk::ruma::events::reaction::SyncReactionEvent;
 use matrix_sdk::ruma::events::room::encrypted::SyncRoomEncryptedEvent;
 use matrix_sdk::ruma::events::room::message::{
     MessageType, Relation, RoomMessageEventContent, SyncRoomMessageEvent,
@@ -156,6 +157,15 @@ async fn backfill(client: &Client, room_id: &matrix_sdk::ruma::RoomId, limit: u3
                 out.push(BackfillMessage {
                     sender_nick: mxid_localpart(orig.sender.as_str()).to_string(),
                     body: "[encrypted — run `matrirc bootstrap-e2ee` to decrypt]".into(),
+                    origin_ms: orig.origin_server_ts.0.into(),
+                });
+            }
+            AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::Reaction(
+                SyncMessageLikeEvent::Original(orig),
+            )) => {
+                out.push(BackfillMessage {
+                    sender_nick: mxid_localpart(orig.sender.as_str()).to_string(),
+                    body: format!("\x01ACTION reacted {}\x01", orig.content.relates_to.key),
                     origin_ms: orig.origin_server_ts.0.into(),
                 });
             }
@@ -346,6 +356,23 @@ pub async fn run_sync(
         "matrix: bridge populated"
     );
     info!("matrix: starting incremental sync loop");
+
+    let bridge_for_reactions = bridge.clone();
+    client.add_event_handler(move |ev: SyncReactionEvent, room: Room| {
+        let bridge = bridge_for_reactions.clone();
+        async move {
+            if !bridge.has_room(room.room_id()) { return; }
+            let Some(orig) = ev.as_original() else { return; };
+            if bridge.take_if_sent_by_us(&orig.event_id) { return; }
+            let key = &orig.content.relates_to.key;
+            let nick = mxid_localpart(orig.sender.as_str()).to_string();
+            let _ = bridge.from_matrix.send(FromMatrix::Message {
+                room: room.room_id().to_owned(),
+                sender_nick: nick.clone(),
+                body: format!("\x01ACTION reacted {key}\x01"),
+            });
+        }
+    });
 
     // Fallback for events the SDK could not decrypt: emit a visible placeholder so
     // users see "something was said" instead of silence.
