@@ -74,13 +74,32 @@ fn body_from_event(content: &RoomMessageEventContent) -> Option<String> {
             MessageType::Emote(t) => t.body.clone(),
             _ => return None,
         };
-        return Some(format!("* edit: {new_body}"));
+        return Some(format!("* edit: {}", strip_reply_fallback(&new_body)));
     }
-    match &content.msgtype {
-        MessageType::Text(t) => Some(t.body.clone()),
-        MessageType::Notice(t) => Some(t.body.clone()),
-        MessageType::Emote(t) => Some(format!("\x01ACTION {}\x01", t.body)),
-        _ => None,
+    let raw = match &content.msgtype {
+        MessageType::Text(t) => t.body.clone(),
+        MessageType::Notice(t) => t.body.clone(),
+        MessageType::Emote(t) => return Some(format!("\x01ACTION {}\x01", t.body)),
+        _ => return None,
+    };
+    let is_reply = matches!(&content.relates_to, Some(Relation::Reply { .. }))
+        || matches!(&content.relates_to, Some(Relation::Thread(t)) if !t.is_falling_back);
+    if is_reply {
+        Some(format!("↳ {}", strip_reply_fallback(&raw)))
+    } else {
+        Some(raw)
+    }
+}
+
+/// Matrix replies embed "> <sender> quoted\n> ...\n\nactual body" in `body`
+/// for clients that don't render the relation. Trim back to the actual body.
+fn strip_reply_fallback(body: &str) -> String {
+    if !body.starts_with("> ") {
+        return body.to_string();
+    }
+    match body.split_once("\n\n") {
+        Some((_, rest)) => rest.to_string(),
+        None => body.to_string(),
     }
 }
 
