@@ -84,6 +84,21 @@ fn body_from_event(content: &RoomMessageEventContent) -> Option<String> {
     }
 }
 
+async fn fetch_members(client: &Client, room_id: &matrix_sdk::ruma::RoomId) -> Vec<String> {
+    let Some(room) = client.get_room(room_id) else { return Vec::new(); };
+    let members = match room.members(RoomMemberships::JOIN).await {
+        Ok(m) => m,
+        Err(e) => {
+            warn!("members {room_id} failed: {e}");
+            return Vec::new();
+        }
+    };
+    members
+        .into_iter()
+        .map(|m| mxid_localpart(m.user_id().as_str()).to_string())
+        .collect()
+}
+
 async fn dm_peer_nick(client: &Client, room: &Room) -> Option<String> {
     let me = client.user_id()?;
     let members = room
@@ -446,6 +461,10 @@ pub async fn run_sync(
                 },
                 ToMatrix::Backfill { room, limit, reply } => {
                     let result = backfill(&send_client, &room, limit).await;
+                    let _ = reply.send(result);
+                }
+                ToMatrix::Members { room, reply } => {
+                    let result = fetch_members(&send_client, &room).await;
                     let _ = reply.send(result);
                 }
             }

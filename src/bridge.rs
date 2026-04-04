@@ -70,6 +70,10 @@ pub enum ToMatrix {
         limit: u32,
         reply: oneshot::Sender<Vec<BackfillMessage>>,
     },
+    Members {
+        room: OwnedRoomId,
+        reply: oneshot::Sender<Vec<String>>,
+    },
 }
 
 #[derive(Debug, Clone)]

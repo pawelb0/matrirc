@@ -261,7 +261,11 @@ async fn join_bridged(
     bridge: &Bridge,
     caps: &HashSet<String>,
 ) -> Result<()> {
-    send_join_lines(write, nick, chan, topic).await?;
+    let user_prefix = format!("{nick}!{nick}@matrirc.local");
+    send(write, Message::with_prefix(&user_prefix, "JOIN", vec![chan.into()])).await?;
+    send(write, srv("332", vec![nick.into(), chan.into(), topic.into()])).await?;
+    let members = fetch_members(bridge, room).await;
+    send_names_reply(write, nick, chan, &members).await?;
     backfill_channel(write, chan, room, bridge, caps).await?;
     Ok(())
 }
@@ -278,6 +282,47 @@ async fn send_join_lines(
     send(write, srv("353", vec![nick.into(), "=".into(), chan.into(), format!("{nick} matrix")])).await?;
     send(write, srv("366", vec![nick.into(), chan.into(), "End of /NAMES list".into()])).await?;
     Ok(())
+}
+
+async fn send_names_reply(
+    write: &mut OwnedWriteHalf,
+    nick: &str,
+    chan: &str,
+    members: &[String],
+) -> Result<()> {
+    let mut names: Vec<&str> = members.iter().map(String::as_str).collect();
+    if !names.iter().any(|n| *n == nick) {
+        names.push(nick);
+    }
+    // Send in batches so the whole 353 payload stays under IRC's 512 byte cap.
+    const BATCH_BYTES: usize = 400;
+    let mut line = String::new();
+    for n in &names {
+        if !line.is_empty() && line.len() + 1 + n.len() > BATCH_BYTES {
+            send(write, srv("353", vec![nick.into(), "=".into(), chan.into(), std::mem::take(&mut line)])).await?;
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(n);
+    }
+    if !line.is_empty() {
+        send(write, srv("353", vec![nick.into(), "=".into(), chan.into(), line])).await?;
+    }
+    send(write, srv("366", vec![nick.into(), chan.into(), "End of /NAMES list".into()])).await?;
+    Ok(())
+}
+
+async fn fetch_members(bridge: &Bridge, room: &matrix_sdk::ruma::RoomId) -> Vec<String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if bridge
+        .to_matrix
+        .try_send(ToMatrix::Members { room: room.to_owned(), reply: tx })
+        .is_err()
+    {
+        return Vec::new();
+    }
+    rx.await.unwrap_or_default()
 }
 
 async fn auto_join_all(
