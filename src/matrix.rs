@@ -10,6 +10,7 @@ use matrix_sdk::ruma::events::room::encrypted::SyncRoomEncryptedEvent;
 use matrix_sdk::ruma::events::room::message::{
     MessageType, Relation, RoomMessageEventContent, SyncRoomMessageEvent,
 };
+use matrix_sdk::ruma::events::room::topic::SyncRoomTopicEvent;
 use matrix_sdk::ruma::events::{
     AnySyncMessageLikeEvent, AnySyncTimelineEvent, SyncMessageLikeEvent,
 };
@@ -68,26 +69,45 @@ pub async fn discover_homeserver(http: &reqwest::Client, server_name: &str) -> R
 
 fn body_from_event(content: &RoomMessageEventContent) -> Option<String> {
     if let Some(Relation::Replacement(repl)) = &content.relates_to {
-        let new_body = match &repl.new_content.msgtype {
-            MessageType::Text(t) => t.body.clone(),
-            MessageType::Notice(t) => t.body.clone(),
-            MessageType::Emote(t) => t.body.clone(),
-            _ => return None,
+        let new_body = match msgtype_body(&repl.new_content.msgtype) {
+            Some(b) => b,
+            None => return None,
         };
         return Some(format!("* edit: {}", strip_reply_fallback(&new_body)));
     }
-    let raw = match &content.msgtype {
-        MessageType::Text(t) => t.body.clone(),
-        MessageType::Notice(t) => t.body.clone(),
-        MessageType::Emote(t) => return Some(format!("\x01ACTION {}\x01", t.body)),
-        _ => return None,
-    };
+    let raw = msgtype_body(&content.msgtype)?;
+    if matches!(content.msgtype, MessageType::Emote(_)) {
+        return Some(raw);
+    }
     let is_reply = matches!(&content.relates_to, Some(Relation::Reply { .. }))
         || matches!(&content.relates_to, Some(Relation::Thread(t)) if !t.is_falling_back);
     if is_reply {
         Some(format!("↳ {}", strip_reply_fallback(&raw)))
     } else {
         Some(raw)
+    }
+}
+
+fn msgtype_body(msg: &MessageType) -> Option<String> {
+    match msg {
+        MessageType::Text(t) => Some(t.body.clone()),
+        MessageType::Notice(t) => Some(t.body.clone()),
+        MessageType::Emote(t) => Some(format!("\x01ACTION {}\x01", t.body)),
+        MessageType::Image(m) => Some(format!("[image] {}{}", m.body, media_suffix(&m.source))),
+        MessageType::File(m) => Some(format!("[file] {}{}", m.body, media_suffix(&m.source))),
+        MessageType::Audio(m) => Some(format!("[audio] {}{}", m.body, media_suffix(&m.source))),
+        MessageType::Video(m) => Some(format!("[video] {}{}", m.body, media_suffix(&m.source))),
+        MessageType::Location(m) => Some(format!("[location] {}", m.body)),
+        MessageType::ServerNotice(m) => Some(format!("[server-notice] {}", m.body)),
+        _ => None,
+    }
+}
+
+fn media_suffix(source: &matrix_sdk::ruma::events::room::MediaSource) -> String {
+    use matrix_sdk::ruma::events::room::MediaSource;
+    match source {
+        MediaSource::Plain(url) => format!(" <{url}>"),
+        MediaSource::Encrypted(file) => format!(" <{}>", file.url),
     }
 }
 
@@ -390,6 +410,17 @@ pub async fn run_sync(
         "matrix: bridge populated"
     );
     info!("matrix: starting incremental sync loop");
+
+    let bridge_for_topic = bridge.clone();
+    client.add_event_handler(move |ev: SyncRoomTopicEvent, room: Room| {
+        let bridge = bridge_for_topic.clone();
+        async move {
+            let Some(orig) = ev.as_original() else { return; };
+            if bridge.update_topic(room.room_id(), orig.content.topic.clone()).is_none() {
+                return;
+            }
+        }
+    });
 
     let bridge_for_reactions = bridge.clone();
     client.add_event_handler(move |ev: SyncReactionEvent, room: Room| {

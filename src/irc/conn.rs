@@ -97,6 +97,15 @@ pub async fn handle(sock: TcpStream, peer: SocketAddr, bridge: Bridge) -> Result
                             matrirc_notice(&mut write, n, &format!("DM available: /msg {dm_nick} ...")).await?;
                         }
                     }
+                    Ok(FromMatrix::TopicChanged { chan, topic }) => {
+                        if !registered { continue; }
+                        if joined.contains(&chan) {
+                            if let Some(n) = nick.as_deref() {
+                                send(&mut write, Message::with_prefix("matrirc.local", "TOPIC", vec![chan, topic])).await?;
+                                let _ = n; // nick unused in TOPIC; keep for future
+                            }
+                        }
+                    }
                     Err(broadcast::error::RecvError::Closed) => break,
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         warn!(%peer, "irc client lagged {n} matrix events");
@@ -228,7 +237,7 @@ async fn handle_join(
             continue;
         }
         if let Some(room) = bridge.room_for(chan) {
-            let topic = format!("Matrix room {room}");
+            let topic = bridge.topic_for(chan).unwrap_or_default();
             join_bridged(write, nick, chan, &room, &topic, bridge, caps).await?;
             joined.insert(chan.to_string());
             continue;
@@ -278,7 +287,11 @@ async fn send_join_lines(
 ) -> Result<()> {
     let user_prefix = format!("{nick}!{nick}@matrirc.local");
     send(write, Message::with_prefix(&user_prefix, "JOIN", vec![chan.into()])).await?;
-    send(write, srv("332", vec![nick.into(), chan.into(), topic.into()])).await?;
+    if topic.is_empty() {
+        send(write, srv("331", vec![nick.into(), chan.into(), "No topic is set".into()])).await?;
+    } else {
+        send(write, srv("332", vec![nick.into(), chan.into(), topic.into()])).await?;
+    }
     send(write, srv("353", vec![nick.into(), "=".into(), chan.into(), format!("{nick} matrix")])).await?;
     send(write, srv("366", vec![nick.into(), chan.into(), "End of /NAMES list".into()])).await?;
     Ok(())
@@ -343,7 +356,7 @@ async fn auto_join_all(
     let mut new_joins = Vec::new();
     for (chan, room) in &snapshot {
         if joined.contains(chan) { continue; }
-        let topic = format!("Matrix room {room}");
+        let topic = bridge.topic_for(chan).unwrap_or_default();
         send_join_lines(write, nick, chan, &topic).await?;
         joined.insert(chan.clone());
         new_joins.push((chan.clone(), room.clone()));

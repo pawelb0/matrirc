@@ -10,15 +10,21 @@ const RECENT_SENT_CAP: usize = 256;
 pub struct Mapping {
     pub room_to_chan: HashMap<OwnedRoomId, String>,
     pub chan_to_room: HashMap<String, OwnedRoomId>,
+    pub chan_to_topic: HashMap<String, String>,
     pub dm_room_to_nick: HashMap<OwnedRoomId, String>,
     pub nick_to_dm_room: HashMap<String, OwnedRoomId>,
 }
 
 impl Mapping {
-    pub fn insert(&mut self, room: OwnedRoomId, chan: impl Into<String>) {
+    pub fn insert(&mut self, room: OwnedRoomId, chan: impl Into<String>, topic: impl Into<String>) {
         let chan = chan.into();
+        self.chan_to_topic.insert(chan.clone(), topic.into());
         self.chan_to_room.insert(chan.clone(), room.clone());
         self.room_to_chan.insert(room, chan);
+    }
+
+    pub fn set_topic(&mut self, chan: &str, topic: String) {
+        self.chan_to_topic.insert(chan.to_string(), topic);
     }
 
     pub fn insert_dm(&mut self, room: OwnedRoomId, nick: impl Into<String>) {
@@ -56,6 +62,10 @@ pub enum FromMatrix {
     },
     DmAdded {
         nick: String,
+    },
+    TopicChanged {
+        chan: String,
+        topic: String,
     },
 }
 
@@ -109,9 +119,25 @@ impl Bridge {
     /// Adds the mapping + broadcasts RoomAdded so live IRC connections auto-join.
     pub fn add_mapping(&self, room: OwnedRoomId, chan: String, topic: String) {
         let mut m = self.mapping.write().unwrap();
-        m.insert(room.clone(), chan.clone());
+        m.insert(room.clone(), chan.clone(), topic.clone());
         drop(m);
         let _ = self.from_matrix.send(FromMatrix::RoomAdded { room, chan, topic });
+    }
+
+    pub fn update_topic(&self, room: &RoomId, topic: String) -> Option<String> {
+        let mut m = self.mapping.write().unwrap();
+        let chan = m.room_to_chan.get(room).cloned()?;
+        m.set_topic(&chan, topic.clone());
+        drop(m);
+        let _ = self.from_matrix.send(FromMatrix::TopicChanged {
+            chan: chan.clone(),
+            topic,
+        });
+        Some(chan)
+    }
+
+    pub fn topic_for(&self, chan: &str) -> Option<String> {
+        self.mapping.read().unwrap().chan_to_topic.get(chan).cloned()
     }
 
     pub fn add_dm(&self, room: OwnedRoomId, nick: String) {
@@ -204,9 +230,10 @@ mod tests {
     fn mapping_round_trip() {
         let mut m = Mapping::default();
         let r = RoomId::parse("!abc:server.org").unwrap();
-        m.insert(r.clone(), "#matrix");
+        m.insert(r.clone(), "#matrix", "topic here");
         assert_eq!(m.room_to_chan.get(&r), Some(&"#matrix".to_string()));
         assert_eq!(m.chan_to_room.get("#matrix"), Some(&r));
+        assert_eq!(m.chan_to_topic.get("#matrix").map(String::as_str), Some("topic here"));
     }
 
     #[test]
