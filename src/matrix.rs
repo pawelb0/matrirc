@@ -67,48 +67,69 @@ pub async fn discover_homeserver(http: &reqwest::Client, server_name: &str) -> R
     Ok(format!("https://{server_name}"))
 }
 
-fn body_from_event(content: &RoomMessageEventContent) -> Option<String> {
+/// IRC mIRC colour codes. 14 = grey, 5 = red, 15 = silver. Reset with \x0f.
+const C_GREY: &str = "\x0314";
+const C_RED: &str = "\x0305";
+const C_SILVER: &str = "\x0315";
+const C_RESET: &str = "\x0f";
+
+fn body_from_event(content: &RoomMessageEventContent, homeserver: &str) -> Option<String> {
     if let Some(Relation::Replacement(repl)) = &content.relates_to {
-        let new_body = match msgtype_body(&repl.new_content.msgtype) {
-            Some(b) => b,
-            None => return None,
-        };
-        return Some(format!("* edit: {}", strip_reply_fallback(&new_body)));
+        let new_body = msgtype_body(&repl.new_content.msgtype, homeserver)?;
+        return Some(format!("{C_GREY}* edit:{C_RESET} {}", strip_reply_fallback(&new_body)));
     }
-    let raw = msgtype_body(&content.msgtype)?;
+    let raw = msgtype_body(&content.msgtype, homeserver)?;
     if matches!(content.msgtype, MessageType::Emote(_)) {
         return Some(raw);
     }
     let is_reply = matches!(&content.relates_to, Some(Relation::Reply { .. }))
         || matches!(&content.relates_to, Some(Relation::Thread(t)) if !t.is_falling_back);
     if is_reply {
-        Some(format!("↳ {}", strip_reply_fallback(&raw)))
+        Some(format!("{C_GREY}↳{C_RESET} {}", strip_reply_fallback(&raw)))
     } else {
         Some(raw)
     }
 }
 
-fn msgtype_body(msg: &MessageType) -> Option<String> {
+fn msgtype_body(msg: &MessageType, homeserver: &str) -> Option<String> {
     match msg {
         MessageType::Text(t) => Some(t.body.clone()),
         MessageType::Notice(t) => Some(t.body.clone()),
         MessageType::Emote(t) => Some(format!("\x01ACTION {}\x01", t.body)),
-        MessageType::Image(m) => Some(format!("[image] {}{}", m.body, media_suffix(&m.source))),
-        MessageType::File(m) => Some(format!("[file] {}{}", m.body, media_suffix(&m.source))),
-        MessageType::Audio(m) => Some(format!("[audio] {}{}", m.body, media_suffix(&m.source))),
-        MessageType::Video(m) => Some(format!("[video] {}{}", m.body, media_suffix(&m.source))),
-        MessageType::Location(m) => Some(format!("[location] {}", m.body)),
-        MessageType::ServerNotice(m) => Some(format!("[server-notice] {}", m.body)),
+        MessageType::Image(m) => Some(media_line("image", &m.body, &m.source, homeserver)),
+        MessageType::File(m) => Some(media_line("file", &m.body, &m.source, homeserver)),
+        MessageType::Audio(m) => Some(media_line("audio", &m.body, &m.source, homeserver)),
+        MessageType::Video(m) => Some(media_line("video", &m.body, &m.source, homeserver)),
+        MessageType::Location(m) => Some(format!("{C_SILVER}[location]{C_RESET} {}", m.body)),
+        MessageType::ServerNotice(m) => Some(format!("{C_GREY}[server-notice]{C_RESET} {}", m.body)),
         _ => None,
     }
 }
 
-fn media_suffix(source: &matrix_sdk::ruma::events::room::MediaSource) -> String {
+fn media_line(
+    kind: &str,
+    caption: &str,
+    source: &matrix_sdk::ruma::events::room::MediaSource,
+    homeserver: &str,
+) -> String {
     use matrix_sdk::ruma::events::room::MediaSource;
-    match source {
-        MediaSource::Plain(url) => format!(" <{url}>"),
-        MediaSource::Encrypted(file) => format!(" <{}>", file.url),
-    }
+    let url = match source {
+        MediaSource::Plain(mxc) => mxc_to_https(mxc.as_str(), homeserver).unwrap_or_else(|| mxc.to_string()),
+        MediaSource::Encrypted(file) => {
+            let base = mxc_to_https(file.url.as_str(), homeserver).unwrap_or_else(|| file.url.to_string());
+            format!("{base} (encrypted)")
+        }
+    };
+    format!("{C_SILVER}[{kind}]{C_RESET} {caption} <{url}>")
+}
+
+fn mxc_to_https(mxc: &str, homeserver: &str) -> Option<String> {
+    let rest = mxc.strip_prefix("mxc://")?;
+    let (server, media_id) = rest.split_once('/')?;
+    Some(format!(
+        "{}/_matrix/media/v3/download/{server}/{media_id}",
+        homeserver.trim_end_matches('/')
+    ))
 }
 
 /// Matrix replies embed "> <sender> quoted\n> ...\n\nactual body" in `body`
@@ -152,7 +173,12 @@ async fn dm_peer_nick(client: &Client, room: &Room) -> Option<String> {
     None
 }
 
-async fn backfill(client: &Client, room_id: &matrix_sdk::ruma::RoomId, limit: u32) -> Vec<BackfillMessage> {
+async fn backfill(
+    client: &Client,
+    room_id: &matrix_sdk::ruma::RoomId,
+    limit: u32,
+    homeserver: &str,
+) -> Vec<BackfillMessage> {
     let Some(room) = client.get_room(room_id) else { return Vec::new(); };
     if matches!(room.encryption_state(), EncryptionState::Encrypted) {
         // Pre-fetch megolm keys from server backup so history decrypts. Silent on
@@ -198,7 +224,7 @@ async fn backfill(client: &Client, room_id: &matrix_sdk::ruma::RoomId, limit: u3
             AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
                 SyncMessageLikeEvent::Original(orig),
             )) => {
-                let Some(body) = body_from_event(&orig.content) else { continue; };
+                let Some(body) = body_from_event(&orig.content, homeserver) else { continue; };
                 out.push(BackfillMessage {
                     sender_nick: mxid_localpart(orig.sender.as_str()).to_string(),
                     body,
@@ -210,7 +236,7 @@ async fn backfill(client: &Client, room_id: &matrix_sdk::ruma::RoomId, limit: u3
             )) => {
                 out.push(BackfillMessage {
                     sender_nick: mxid_localpart(orig.sender.as_str()).to_string(),
-                    body: "[encrypted — run `matrirc bootstrap-e2ee` to decrypt]".into(),
+                    body: format!("{C_RED}[encrypted — run `matrirc bootstrap-e2ee` to decrypt]{C_RESET}"),
                     origin_ms: orig.origin_server_ts.0.into(),
                 });
             }
@@ -452,14 +478,16 @@ pub async fn run_sync(
             let _ = bridge.from_matrix.send(FromMatrix::Message {
                 room: room.room_id().to_owned(),
                 sender_nick: nick,
-                body: "[encrypted — run `matrirc bootstrap-e2ee` once to decrypt]".into(),
+                body: format!("{C_RED}[encrypted — run `matrirc bootstrap-e2ee` once to decrypt]{C_RESET}"),
             });
         }
     });
 
     let bridge_for_handler = bridge.clone();
+    let homeserver_for_handler = cfg.homeserver_url.clone();
     client.add_event_handler(move |ev: SyncRoomMessageEvent, room: Room| {
         let bridge = bridge_for_handler.clone();
+        let homeserver = homeserver_for_handler.clone();
         async move {
             if !bridge.has_room(room.room_id()) {
                 return;
@@ -470,7 +498,7 @@ pub async fn run_sync(
             if bridge.take_if_sent_by_us(&orig.event_id) {
                 return;
             }
-            let body = match body_from_event(&orig.content) {
+            let body = match body_from_event(&orig.content, &homeserver) {
                 Some(b) => b,
                 None => return,
             };
@@ -485,6 +513,7 @@ pub async fn run_sync(
 
     let send_client = client.clone();
     let send_bridge = bridge.clone();
+    let homeserver_for_sender = cfg.homeserver_url.clone();
     tokio::spawn(async move {
         while let Some(cmd) = to_matrix.recv().await {
             match cmd {
@@ -510,7 +539,7 @@ pub async fn run_sync(
                     None => warn!("matrix room not found: {room}"),
                 },
                 ToMatrix::Backfill { room, limit, reply } => {
-                    let result = backfill(&send_client, &room, limit).await;
+                    let result = backfill(&send_client, &room, limit, &homeserver_for_sender).await;
                     let _ = reply.send(result);
                 }
                 ToMatrix::Members { room, reply } => {
