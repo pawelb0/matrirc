@@ -387,6 +387,69 @@ async fn matrirc_notice(write: &mut OwnedWriteHalf, nick: &str, body: &str) -> R
     .await
 }
 
+async fn matrirc_msg(write: &mut OwnedWriteHalf, nick: &str, body: &str) -> Result<()> {
+    send(
+        write,
+        Message::with_prefix("matrirc!matrirc@matrirc.local", "PRIVMSG", vec![nick.into(), body.into()]),
+    )
+    .await
+}
+
+async fn handle_bot_command(
+    write: &mut OwnedWriteHalf,
+    nick: &str,
+    text: &str,
+    bridge: &Bridge,
+) -> Result<()> {
+    let cmd = text.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+    match cmd.as_str() {
+        "" | "help" | "?" => {
+            for line in [
+                "matrirc — local Matrix↔IRC bridge",
+                "commands:",
+                "  help           this message",
+                "  rooms          list bridged Matrix channels",
+                "  dms            list known Matrix DMs",
+                "  version        matrirc version + crate info",
+            ] {
+                matrirc_msg(write, nick, line).await?;
+            }
+        }
+        "rooms" => {
+            let mut rows = bridge.snapshot();
+            rows.sort_by(|a, b| a.0.cmp(&b.0));
+            if rows.is_empty() {
+                matrirc_msg(write, nick, "no channels bridged yet (sync still running?)").await?;
+            } else {
+                matrirc_msg(write, nick, &format!("{} channel(s):", rows.len())).await?;
+                for (chan, room) in rows {
+                    matrirc_msg(write, nick, &format!("  {chan}  →  {room}")).await?;
+                }
+            }
+        }
+        "dms" => {
+            let count = bridge.dm_count();
+            if count == 0 {
+                matrirc_msg(write, nick, "no DMs registered").await?;
+            } else {
+                matrirc_msg(write, nick, &format!("{count} DM(s): use /msg <nick> to talk")).await?;
+            }
+        }
+        "version" => {
+            matrirc_msg(
+                write,
+                nick,
+                concat!("matrirc ", env!("CARGO_PKG_VERSION"), " (matrix-sdk 0.14, rustls)"),
+            )
+            .await?;
+        }
+        other => {
+            matrirc_msg(write, nick, &format!("unknown command: {other}  (try `help`)")).await?;
+        }
+    }
+    Ok(())
+}
+
 async fn backfill_channel(
     write: &mut OwnedWriteHalf,
     chan: &str,
@@ -475,6 +538,11 @@ async fn handle_privmsg(
         return Ok(());
     }
 
+    if target.eq_ignore_ascii_case("matrirc") {
+        handle_bot_command(write, nick, text, bridge).await?;
+        return Ok(());
+    }
+
     if let Some(room) = bridge.room_for(target) {
         if let Err(e) = bridge.to_matrix.try_send(ToMatrix::Send {
             room,
@@ -525,7 +593,8 @@ async fn send_welcome(write: &mut OwnedWriteHalf, nick: &str) -> Result<()> {
     send(write, srv("004", vec![n.clone(), SERVER_NAME.into(), VERSION.into(), "".into(), "".into()])).await?;
     send(write, srv("375", vec![n.clone(), format!("- {SERVER_NAME} Message of the day -")])).await?;
     send(write, srv("372", vec![n.clone(), "- matrirc: Matrix rooms auto-joined after this line.".into()])).await?;
-    send(write, srv("372", vec![n.clone(), format!("- try also /join {ECHO_CHAN} for the local echo channel.")])).await?;
+    send(write, srv("372", vec![n.clone(), "- /msg matrirc help  for bridge commands.".into()])).await?;
+    send(write, srv("372", vec![n.clone(), format!("- /join {ECHO_CHAN}  for a local echo channel.")])).await?;
     send(write, srv("376", vec![n, "End of /MOTD command.".into()])).await?;
     Ok(())
 }
