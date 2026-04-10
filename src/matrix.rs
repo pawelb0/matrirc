@@ -73,6 +73,37 @@ const C_RED: &str = "\x0305";
 const C_SILVER: &str = "\x0315";
 const C_RESET: &str = "\x0f";
 
+async fn sender_nick(room: &Room, sender: &matrix_sdk::ruma::UserId) -> String {
+    let display = match room.get_member_no_sync(sender).await {
+        Ok(Some(m)) => m.display_name().map(ToOwned::to_owned),
+        _ => None,
+    };
+    match display {
+        Some(d) => sanitize_nick(&d),
+        None => mxid_localpart(sender.as_str()).to_string(),
+    }
+}
+
+fn sanitize_nick(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() || "-_|[]{}".contains(c) {
+            out.push(c);
+        } else if out.chars().last() != Some('_') {
+            out.push('_');
+        }
+    }
+    let out = out.trim_matches('_').to_string();
+    if out.is_empty() {
+        return "_".into();
+    }
+    let mut capped: String = out.chars().take(16).collect();
+    if capped.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+        capped.insert(0, '_');
+    }
+    capped
+}
+
 fn body_from_event(content: &RoomMessageEventContent, homeserver: &str) -> Option<String> {
     if let Some(Relation::Replacement(repl)) = &content.relates_to {
         let new_body = msgtype_body(&repl.new_content.msgtype, homeserver)?;
@@ -155,7 +186,10 @@ async fn fetch_members(client: &Client, room_id: &matrix_sdk::ruma::RoomId) -> V
     };
     members
         .into_iter()
-        .map(|m| mxid_localpart(m.user_id().as_str()).to_string())
+        .map(|m| match m.display_name() {
+            Some(d) => sanitize_nick(d),
+            None => mxid_localpart(m.user_id().as_str()).to_string(),
+        })
         .collect()
 }
 
@@ -226,7 +260,7 @@ async fn backfill(
             )) => {
                 let Some(body) = body_from_event(&orig.content, homeserver) else { continue; };
                 out.push(BackfillMessage {
-                    sender_nick: mxid_localpart(orig.sender.as_str()).to_string(),
+                    sender_nick: sender_nick(&room, &orig.sender).await,
                     body,
                     origin_ms: orig.origin_server_ts.0.into(),
                 });
@@ -235,7 +269,7 @@ async fn backfill(
                 SyncMessageLikeEvent::Original(orig),
             )) => {
                 out.push(BackfillMessage {
-                    sender_nick: mxid_localpart(orig.sender.as_str()).to_string(),
+                    sender_nick: sender_nick(&room, &orig.sender).await,
                     body: format!("{C_RED}[encrypted — run `matrirc bootstrap-e2ee` to decrypt]{C_RESET}"),
                     origin_ms: orig.origin_server_ts.0.into(),
                 });
@@ -244,7 +278,7 @@ async fn backfill(
                 SyncMessageLikeEvent::Original(orig),
             )) => {
                 out.push(BackfillMessage {
-                    sender_nick: mxid_localpart(orig.sender.as_str()).to_string(),
+                    sender_nick: sender_nick(&room, &orig.sender).await,
                     body: format!("\x01ACTION reacted {}\x01", orig.content.relates_to.key),
                     origin_ms: orig.origin_server_ts.0.into(),
                 });
@@ -456,7 +490,7 @@ pub async fn run_sync(
             let Some(orig) = ev.as_original() else { return; };
             if bridge.take_if_sent_by_us(&orig.event_id) { return; }
             let key = &orig.content.relates_to.key;
-            let nick = mxid_localpart(orig.sender.as_str()).to_string();
+            let nick = sender_nick(&room, &orig.sender).await;
             let _ = bridge.from_matrix.send(FromMatrix::Message {
                 room: room.room_id().to_owned(),
                 sender_nick: nick.clone(),
@@ -474,7 +508,7 @@ pub async fn run_sync(
             if !bridge.has_room(room.room_id()) { return; }
             let Some(orig) = ev.as_original() else { return; };
             if bridge.take_if_sent_by_us(&orig.event_id) { return; }
-            let nick = mxid_localpart(orig.sender.as_str()).to_string();
+            let nick = sender_nick(&room, &orig.sender).await;
             let _ = bridge.from_matrix.send(FromMatrix::Message {
                 room: room.room_id().to_owned(),
                 sender_nick: nick,
@@ -502,7 +536,7 @@ pub async fn run_sync(
                 Some(b) => b,
                 None => return,
             };
-            let nick = mxid_localpart(orig.sender.as_str()).to_string();
+            let nick = sender_nick(&room, &orig.sender).await;
             let _ = bridge.from_matrix.send(FromMatrix::Message {
                 room: room.room_id().to_owned(),
                 sender_nick: nick,
