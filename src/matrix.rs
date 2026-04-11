@@ -291,7 +291,7 @@ async fn backfill(
 
 async fn build_client_restored(cfg: &Config) -> Result<Client> {
     let store = store_path()?;
-    std::fs::create_dir_all(&store).with_context(|| format!("create {}", store.display()))?;
+    ensure_secret_dir(&store)?;
     let client = Client::builder()
         .homeserver_url(&cfg.homeserver_url)
         .sqlite_store(&store, None)
@@ -320,6 +320,15 @@ pub async fn bootstrap_e2ee(recovery_key: String) -> Result<()> {
     let cfg_path = crate::config::config_path()?;
     let cfg = Config::load(&cfg_path)
         .with_context(|| format!("load config {}", cfg_path.display()))?;
+    let store = store_path()?;
+
+    println!("matrirc bootstrap-e2ee");
+    println!("  homeserver:   {}", cfg.homeserver_url);
+    println!("  user:         {}", cfg.mxid);
+    println!("  device:       {}", cfg.device_id);
+    println!("  crypto store: {} (will be mode 0700)", store.display());
+    println!();
+
     info!("bootstrap-e2ee: building client");
     let client = build_client_restored(&cfg).await?;
     info!("bootstrap-e2ee: running initial sync so the olm machine is ready");
@@ -327,7 +336,7 @@ pub async fn bootstrap_e2ee(recovery_key: String) -> Result<()> {
         .sync_once(SyncSettings::default())
         .await
         .context("initial sync")?;
-    info!("bootstrap-e2ee: calling recovery().recover()");
+    info!("bootstrap-e2ee: opening secret storage with recovery key");
     client
         .encryption()
         .recovery()
@@ -337,18 +346,49 @@ pub async fn bootstrap_e2ee(recovery_key: String) -> Result<()> {
     drop(recovery_key);
 
     info!("bootstrap-e2ee: self-signing this device with the imported self-signing key");
-    match client.encryption().get_own_device().await.context("get own device")? {
+    let verified = match client.encryption().get_own_device().await.context("get own device")? {
         Some(device) => match device.verify().await {
-            Ok(()) => info!("bootstrap-e2ee: device signed + marked verified"),
-            Err(e) => warn!("self-sign failed (other clients may refuse key share): {e}"),
+            Ok(()) => true,
+            Err(e) => {
+                warn!("self-sign failed (other clients may refuse key share): {e}");
+                false
+            }
         },
-        None => warn!("own device not found in crypto store"),
-    }
+        None => {
+            warn!("own device not found in crypto store");
+            false
+        }
+    };
 
-    println!("E2EE bootstrap complete. Cross-signing + backup secrets imported, device self-signed.");
-    println!("Megolm message keys are fetched lazily the first time you /join a channel.");
-    println!("Restart the daemon to pick up the new crypto state.");
+    println!("✓ secrets imported (cross-signing + message-key backup)");
+    if verified {
+        println!("✓ device self-signed and marked verified");
+    } else {
+        println!("✗ device self-signing failed — see log above");
+    }
+    println!();
+    println!("what is stored:");
+    println!("  {:<34} (access token, mode 0600)", cfg_path.display().to_string());
+    println!("  {:<34} (sqlite crypto store, mode 0700)", store.display().to_string());
+    println!("  (recovery key is NOT stored anywhere — scrubbed from memory after import)");
+    println!();
+    println!("next: restart the daemon (pkill matrirc; cargo run) — new messages will decrypt.");
     Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_secret_dir(p: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(p).with_context(|| format!("create {}", p.display()))?;
+    let perms = std::fs::Permissions::from_mode(0o700);
+    std::fs::set_permissions(p, perms)
+        .with_context(|| format!("chmod 0700 {}", p.display()))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_secret_dir(p: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(p).with_context(|| format!("create {}", p.display()))
 }
 
 pub fn store_path() -> Result<PathBuf> {
@@ -371,7 +411,7 @@ pub async fn run_sync(
     env_override_room: Option<matrix_sdk::ruma::OwnedRoomId>,
 ) -> Result<()> {
     let store = store_path()?;
-    std::fs::create_dir_all(&store).with_context(|| format!("create {}", store.display()))?;
+    ensure_secret_dir(&store)?;
 
     let client = Client::builder()
         .homeserver_url(&cfg.homeserver_url)

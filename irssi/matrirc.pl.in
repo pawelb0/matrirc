@@ -3,22 +3,29 @@ use warnings;
 use Irssi;
 use IO::Socket::INET;
 
-our $VERSION = '0.1.0';
+our $VERSION = '0.2.0';
 our %IRSSI = (
     authors     => 'matrirc',
     name        => 'matrirc',
-    description => 'Auto-start matrirc daemon and connect irssi to it',
+    description => 'Auto-start, supervise, and reconnect the matrirc daemon',
     license     => 'GPL-3.0-or-later',
 );
 
-my $BIN  = '__MATRIRC_BIN__';
-my $HOST = '127.0.0.1';
-my $PORT = 6667;
+my $BIN       = '__MATRIRC_BIN__';
+my $HOST      = '127.0.0.1';
+my $PORT      = 6667;
 my $STATE_DIR = "$ENV{HOME}/.local/state/matrirc";
 my $LOG       = "$STATE_DIR/log";
 
-my $start_time;
-my $tick_id;
+# How often we re-check daemon/connection state.
+my $POLL_MS     = 5000;
+# Minimum seconds between spawn attempts — guards against crash loops.
+my $SPAWN_GRACE = 5;
+
+my $poll_id;
+my $spawn_cooldown  = 0;
+my $last_state      = 'unknown';  # connected | starting | down | unknown
+my $unload_requested = 0;
 
 sub daemon_alive {
     my $sock = IO::Socket::INET->new(
@@ -32,7 +39,7 @@ sub daemon_alive {
     return 1;
 }
 
-sub already_connected {
+sub have_irc_connection {
     for my $s (Irssi::servers()) {
         return 1 if $s->{address} eq $HOST && $s->{port} == $PORT;
     }
@@ -40,39 +47,60 @@ sub already_connected {
 }
 
 sub spawn_daemon {
-    Irssi::print("matrirc: starting daemon ($BIN)");
+    my $now = time();
+    return if $spawn_cooldown > $now;
+    $spawn_cooldown = $now + $SPAWN_GRACE;
     system("mkdir -p '$STATE_DIR'");
     system("nohup '$BIN' run >>'$LOG' 2>&1 </dev/null &");
 }
 
-sub tick {
-    if (already_connected()) {
-        Irssi::timeout_remove($tick_id);
-        $tick_id = undef;
+sub set_state {
+    my ($new, $msg) = @_;
+    return if $new eq $last_state;
+    Irssi::print($msg) if defined $msg;
+    $last_state = $new;
+}
+
+sub poll {
+    return if $unload_requested;
+
+    my $alive     = daemon_alive();
+    my $connected = have_irc_connection();
+
+    if (!$alive && !$connected) {
+        set_state('down',
+            "%Rmatrirc%n daemon is down (port $PORT unreachable). Restarting — log at $LOG");
+        spawn_daemon();
         return;
     }
-    if (daemon_alive()) {
-        Irssi::timeout_remove($tick_id);
-        $tick_id = undef;
-        Irssi::print("matrirc: daemon up, connecting");
+
+    if ($alive && !$connected) {
+        set_state('starting', 'matrirc: daemon up, connecting');
         Irssi::command("connect $HOST $PORT");
         return;
     }
-    if (time() - $start_time > 10) {
-        Irssi::timeout_remove($tick_id);
-        $tick_id = undef;
-        Irssi::print("matrirc: daemon failed to start within 10s; check $LOG");
-    }
-}
 
-sub init {
-    if (already_connected()) {
-        Irssi::print("matrirc: already connected");
+    if ($alive && $connected) {
+        set_state('connected', 'matrirc: connected');
         return;
     }
-    spawn_daemon() unless daemon_alive();
-    $start_time = time();
-    $tick_id = Irssi::timeout_add(200, 'tick', undef);
 }
 
-init();
+sub start {
+    poll();
+    $poll_id = Irssi::timeout_add($POLL_MS, 'poll', undef);
+}
+
+sub stop {
+    $unload_requested = 1;
+    Irssi::timeout_remove($poll_id) if $poll_id;
+    $poll_id = undef;
+}
+
+Irssi::signal_add_last('script unload' => sub {
+    my ($script) = @_;
+    return unless $script->{name} eq $IRSSI{name};
+    stop();
+});
+
+start();
