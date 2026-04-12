@@ -51,6 +51,10 @@ pub enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Report whether a matrirc daemon is currently running.
+    Status,
+    /// Stop the running daemon (SIGTERM).
+    Stop,
 }
 
 pub async fn login(mxid: &str, homeserver_override: Option<&str>) -> Result<()> {
@@ -119,6 +123,36 @@ fn read_secret(env: &str, label: &str) -> Result<String> {
         return Err(anyhow!("empty {label} on stdin"));
     }
     Ok(t)
+}
+
+pub fn status() -> Result<()> {
+    let pid_path = crate::daemon::pid_file_path()?;
+    match crate::daemon::read_pid(&pid_path)? {
+        Some(pid) if crate::daemon::alive(pid) => {
+            println!("daemon running (pid {pid}) — {}", pid_path.display());
+        }
+        Some(pid) => {
+            println!("stale pid file (pid {pid} not running) — {}", pid_path.display());
+        }
+        None => println!("daemon not running"),
+    }
+    Ok(())
+}
+
+pub fn stop() -> Result<()> {
+    let pid_path = crate::daemon::pid_file_path()?;
+    let Some(pid) = crate::daemon::read_pid(&pid_path)? else {
+        println!("no pid file — daemon probably not running");
+        return Ok(());
+    };
+    if !crate::daemon::alive(pid) {
+        println!("pid {pid} not running; removing stale pid file");
+        let _ = std::fs::remove_file(&pid_path);
+        return Ok(());
+    }
+    crate::daemon::send_sigterm(pid)?;
+    println!("sent SIGTERM to pid {pid}");
+    Ok(())
 }
 
 pub fn reset(force: bool) -> Result<()> {

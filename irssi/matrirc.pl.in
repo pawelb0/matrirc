@@ -16,6 +16,7 @@ my $HOST      = '127.0.0.1';
 my $PORT      = 6667;
 my $STATE_DIR = "$ENV{HOME}/.local/state/matrirc";
 my $LOG       = "$STATE_DIR/log";
+my $PID_FILE  = "$STATE_DIR/daemon.pid";
 
 # How often we re-check daemon/connection state.
 my $POLL_MS     = 5000;
@@ -26,6 +27,9 @@ my $poll_id;
 my $spawn_cooldown  = 0;
 my $last_state      = 'unknown';  # connected | starting | down | unknown
 my $unload_requested = 0;
+# Track whether this script spawned the current daemon, so we only stop it
+# on unload if we started it (leaves pre-existing daemons alone).
+my $spawned_by_us    = 0;
 
 sub daemon_alive {
     my $sock = IO::Socket::INET->new(
@@ -46,12 +50,35 @@ sub have_irc_connection {
     return 0;
 }
 
+sub read_pid {
+    open(my $fh, '<', $PID_FILE) or return undef;
+    my $pid = <$fh>;
+    close $fh;
+    return unless defined $pid;
+    $pid =~ s/\s+//g;
+    return $pid =~ /^\d+$/ ? $pid + 0 : undef;
+}
+
+sub pid_is_alive {
+    my $pid = shift;
+    return kill(0, $pid) ? 1 : 0;
+}
+
 sub spawn_daemon {
     my $now = time();
     return if $spawn_cooldown > $now;
     $spawn_cooldown = $now + $SPAWN_GRACE;
     system("mkdir -p '$STATE_DIR'");
     system("nohup '$BIN' run >>'$LOG' 2>&1 </dev/null &");
+    $spawned_by_us = 1;
+}
+
+sub kill_daemon_if_ours {
+    return unless $spawned_by_us;
+    my $pid = read_pid();
+    return unless defined $pid && pid_is_alive($pid);
+    Irssi::print("matrirc: sending SIGTERM to daemon (pid $pid)");
+    kill('TERM', $pid);
 }
 
 sub set_state {
@@ -95,6 +122,7 @@ sub stop {
     $unload_requested = 1;
     Irssi::timeout_remove($poll_id) if $poll_id;
     $poll_id = undef;
+    kill_daemon_if_ours();
 }
 
 Irssi::signal_add_last('script unload' => sub {
@@ -102,5 +130,11 @@ Irssi::signal_add_last('script unload' => sub {
     return unless $script->{name} eq $IRSSI{name};
     stop();
 });
+
+# If the daemon is already running when we load, assume the user started it
+# externally; don't claim ownership.
+if (defined read_pid() && pid_is_alive(read_pid())) {
+    $spawned_by_us = 0;
+}
 
 start();

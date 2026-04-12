@@ -3,6 +3,7 @@
 mod bridge;
 mod cli;
 mod config;
+mod daemon;
 mod irc;
 mod matrix;
 mod names;
@@ -22,12 +23,16 @@ async fn main() -> Result<()> {
         Command::Login { mxid, homeserver } => cli::login(&mxid, homeserver.as_deref()).await,
         Command::BootstrapE2ee => matrix::bootstrap_e2ee(cli::read_recovery_key()?).await,
         Command::Reset { force } => cli::reset(force),
+        Command::Status => cli::status(),
+        Command::Stop => cli::stop(),
     }
 }
 
 async fn run() -> Result<()> {
     use std::sync::Arc;
     use tracing::warn;
+
+    let _pid_guard = daemon::claim()?;
 
     let override_pair = bridge::env_override();
     let (bridge_state, to_matrix_rx) = bridge::Bridge::new(bridge::Mapping::default());
@@ -67,11 +72,35 @@ async fn run() -> Result<()> {
         }
     };
 
-    let irc_result = irc::serve("127.0.0.1:6667", bridge_state).await;
+    let serve = irc::serve("127.0.0.1:6667", bridge_state);
+    tokio::pin!(serve);
+    let result = tokio::select! {
+        r = &mut serve => r,
+        _ = wait_for_signal() => {
+            tracing::info!("received shutdown signal, exiting");
+            Ok(())
+        }
+    };
     if let Some(h) = matrix_handle {
         h.abort();
     }
-    irc_result
+    result
+}
+
+#[cfg(unix)]
+async fn wait_for_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = match signal(SignalKind::terminate()) { Ok(s) => s, Err(_) => return };
+    let mut int = match signal(SignalKind::interrupt()) { Ok(s) => s, Err(_) => return };
+    tokio::select! {
+        _ = term.recv() => {},
+        _ = int.recv() => {},
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_signal() {
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 fn init_tracing() {
