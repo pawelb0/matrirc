@@ -20,7 +20,9 @@ async fn main() -> Result<()> {
     match args.command.unwrap_or(Command::Run) {
         Command::Run => run().await,
         Command::InstallIrssi { force, dry_run } => cli::install_irssi(force, dry_run),
-        Command::Login { mxid, homeserver } => cli::login(&mxid, homeserver.as_deref()).await,
+        Command::Login { mxid, homeserver, token, skip_verify } => {
+            cli::login(&mxid, homeserver.as_deref(), token, skip_verify).await
+        }
         Command::BootstrapE2ee => matrix::bootstrap_e2ee(cli::read_recovery_key()?).await,
         Command::Reset { force } => cli::reset(force),
         Command::Status => cli::status(),

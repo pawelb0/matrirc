@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 
-use crate::config::{config_path, Config};
+use crate::config::config_path;
 use crate::matrix;
 
 const PERL_TEMPLATE: &str = include_str!("../irssi/matrirc.pl.in");
@@ -29,14 +29,23 @@ pub enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Verify a Matrix access token and persist it to ~/.config/matrirc/config.toml.
-    /// Token is read from MATRIRC_TOKEN env var, or piped on stdin.
+    /// Log in to a Matrix homeserver. By default prompts for your password
+    /// (m.login.password) and then walks you through SAS emoji verification
+    /// from another device to enable E2EE rooms. Pass --token to use an
+    /// existing access token instead (read from MATRIRC_TOKEN or stdin);
+    /// --skip-verify to delay E2EE setup until `matrirc bootstrap-e2ee`.
     Login {
         /// Your Matrix user ID, e.g. @you:matrix.org
         mxid: String,
         /// Override the homeserver URL instead of resolving via .well-known.
         #[arg(long)]
         homeserver: Option<String>,
+        /// Use an access token instead of password login.
+        #[arg(long)]
+        token: bool,
+        /// Skip SAS device verification after login.
+        #[arg(long)]
+        skip_verify: bool,
     },
     /// One-shot import of cross-signing + message backup key using a Secure Secret
     /// Storage recovery key. Required once per fresh crypto store so E2EE rooms decrypt.
@@ -57,46 +66,82 @@ pub enum Command {
     Stop,
 }
 
-pub async fn login(mxid: &str, homeserver_override: Option<&str>) -> Result<()> {
+pub async fn login(
+    mxid: &str,
+    homeserver_override: Option<&str>,
+    use_token: bool,
+    skip_verify: bool,
+) -> Result<()> {
     let server_name = matrix::server_name_from_mxid(mxid)?;
-    let token = read_token()?;
-
     let http = reqwest::Client::builder()
         .user_agent(concat!("matrirc/", env!("CARGO_PKG_VERSION")))
         .build()?;
-
     let homeserver_url = match homeserver_override {
         Some(h) => h.trim_end_matches('/').to_string(),
         None => matrix::discover_homeserver(&http, server_name).await?,
     };
 
-    let who = matrix::whoami(&http, &homeserver_url, &token).await?;
-    if who.user_id != mxid {
-        return Err(anyhow!(
-            "token belongs to {} but you specified {mxid}",
-            who.user_id
-        ));
-    }
-    let device_id = who
-        .device_id
-        .ok_or_else(|| anyhow!("homeserver did not return a device_id; token may be guest"))?;
-
-    let cfg = Config {
-        mxid: mxid.to_string(),
-        homeserver_url: homeserver_url.clone(),
-        access_token: token,
-        device_id: device_id.clone(),
+    let (cfg, client) = if use_token {
+        let token = read_secret("MATRIRC_TOKEN", "token")?;
+        matrix::login_with_token(&homeserver_url, mxid, &token).await?
+    } else {
+        let password = read_password_for_mxid(mxid)?;
+        matrix::login_with_password(&homeserver_url, mxid, &password).await?
     };
+
     let path = config_path()?;
     cfg.save(&path)?;
+    println!(
+        "✓ logged in as {} (device {}) on {}",
+        cfg.mxid, cfg.device_id, cfg.homeserver_url
+    );
+    println!("  config written to {}", path.display());
 
-    println!("logged in as {mxid} (device {device_id}) on {homeserver_url}");
-    println!("config written to {}", path.display());
+    if skip_verify {
+        println!();
+        println!("--skip-verify set. Encrypted rooms won't decrypt until you run");
+        println!("  matrirc bootstrap-e2ee   (recovery-key path)   OR");
+        println!("  matrirc login --skip-verify=false  (to re-run SAS verification).");
+        return Ok(());
+    }
+
+    println!();
+    match matrix::run_sas_bootstrap(&client).await {
+        Ok(true) => {
+            println!("✓ device verified. E2EE ready. Start the daemon with `matrirc run`.");
+        }
+        Ok(false) => {
+            println!("device is already trusted. E2EE ready. Start the daemon with `matrirc run`.");
+        }
+        Err(e) => {
+            println!("× SAS verification didn't finish: {e}");
+            println!("  Encrypted rooms won't decrypt until you retry. Options:");
+            println!("    matrirc login    # retry SAS verification");
+            println!("    matrirc bootstrap-e2ee    # paste your recovery key instead");
+        }
+    }
     Ok(())
 }
 
-fn read_token() -> Result<String> {
-    read_secret("MATRIRC_TOKEN", "token")
+fn read_password_for_mxid(mxid: &str) -> Result<String> {
+    if let Ok(p) = std::env::var("MATRIRC_PASSWORD") {
+        let p = p.trim().to_string();
+        if !p.is_empty() {
+            return Ok(p);
+        }
+    }
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        let mut buf = String::new();
+        std::io::stdin().read_to_string(&mut buf).context("read stdin")?;
+        let p = buf.trim().to_string();
+        if p.is_empty() {
+            return Err(anyhow!("empty password on stdin"));
+        }
+        return Ok(p);
+    }
+    let prompt = format!("password for {mxid}: ");
+    rpassword::prompt_password(prompt).context("prompt password")
 }
 
 pub fn read_recovery_key() -> Result<String> {
@@ -195,10 +240,10 @@ pub fn reset(force: bool) -> Result<()> {
     println!();
     println!("next steps:");
     println!("  1. Element → Settings → Sessions → sign out the old matrirc device.");
-    println!("  2. Create a fresh access token (same screen).");
-    println!("  3. matrirc login @you:server.org  (token via MATRIRC_TOKEN or stdin)");
-    println!("  4. matrirc bootstrap-e2ee         (for E2EE room history)");
-    println!("  5. matrirc run");
+    println!("  2. matrirc login @you:server.org");
+    println!("       prompts for password, then walks you through emoji verification");
+    println!("       from another Element device to enable E2EE rooms.");
+    println!("  3. matrirc run");
     Ok(())
 }
 

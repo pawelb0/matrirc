@@ -19,6 +19,7 @@ toml = "0.8"
 matrix-sdk = { version = "=0.14", default-features = false, features = ["rustls-tls", "sqlite", "e2e-encryption"] }
 time = { version = "0.3", features = ["formatting", "macros"] }
 libc = "0.2"
+rpassword = "7"
 
 [dev-dependencies]
 tempfile = "3"

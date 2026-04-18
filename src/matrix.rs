@@ -631,6 +631,195 @@ pub async fn run_sync(
     Ok(())
 }
 
+pub async fn login_with_password(
+    homeserver: &str,
+    mxid: &str,
+    password: &str,
+) -> Result<(Config, Client)> {
+    let store = store_path()?;
+    ensure_secret_dir(&store)?;
+    let client = Client::builder()
+        .homeserver_url(homeserver)
+        .sqlite_store(&store, None)
+        .build()
+        .await
+        .context("build matrix client")?;
+    let device_display = device_display_name();
+    let resp = client
+        .matrix_auth()
+        .login_username(mxid, password)
+        .initial_device_display_name(&device_display)
+        .send()
+        .await
+        .context("m.login.password")?;
+    let cfg = Config {
+        mxid: resp.user_id.to_string(),
+        homeserver_url: homeserver.trim_end_matches('/').to_string(),
+        access_token: resp.access_token,
+        device_id: resp.device_id.to_string(),
+    };
+    Ok((cfg, client))
+}
+
+pub async fn login_with_token(
+    homeserver: &str,
+    mxid: &str,
+    token: &str,
+) -> Result<(Config, Client)> {
+    let http = reqwest::Client::builder()
+        .user_agent(concat!("matrirc/", env!("CARGO_PKG_VERSION")))
+        .build()?;
+    let who = whoami(&http, homeserver, token).await?;
+    if who.user_id != mxid {
+        return Err(anyhow!(
+            "token belongs to {} but you specified {mxid}",
+            who.user_id
+        ));
+    }
+    let device_id = who
+        .device_id
+        .ok_or_else(|| anyhow!("homeserver did not return a device_id; token may be guest"))?;
+    let cfg = Config {
+        mxid: mxid.to_string(),
+        homeserver_url: homeserver.trim_end_matches('/').to_string(),
+        access_token: token.to_string(),
+        device_id,
+    };
+    let client = build_client_restored(&cfg).await?;
+    Ok((cfg, client))
+}
+
+fn device_display_name() -> String {
+    let host = hostname().unwrap_or_else(|| "unknown".to_string());
+    format!("matrirc ({host})")
+}
+
+fn hostname() -> Option<String> {
+    std::env::var("HOSTNAME").ok().or_else(|| {
+        std::process::Command::new("hostname")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    })
+}
+
+/// Runs SAS emoji verification against another already-verified device.
+/// Returns `Ok(true)` on successful verification, `Ok(false)` if the device was
+/// already trusted and no action was needed, Err on failure/timeout/cancel.
+pub async fn run_sas_bootstrap(client: &Client) -> Result<bool> {
+    use std::time::Duration;
+    use matrix_sdk::encryption::verification::{SasState, VerificationRequestState};
+
+    info!("sync_once before SAS");
+    client
+        .sync_once(SyncSettings::default())
+        .await
+        .context("initial sync")?;
+
+    let own_id = client.user_id().ok_or_else(|| anyhow!("no user id"))?.to_owned();
+    let already_trusted = match client.encryption().get_own_device().await {
+        Ok(Some(dev)) => dev.is_verified(),
+        _ => false,
+    };
+    if already_trusted {
+        return Ok(false);
+    }
+
+    let identity = client
+        .encryption()
+        .request_user_identity(&own_id)
+        .await
+        .context("request own identity")?
+        .ok_or_else(|| anyhow!("no cross-signing identity yet — has another Element session set up key backup?"))?;
+
+    let request = identity
+        .request_verification()
+        .await
+        .context("start verification request")?;
+
+    println!("matrirc is asking another of your devices to verify this one.");
+    println!("→ open Element (phone/desktop) → accept the verification request from device {:?}",
+        device_display_name());
+    println!("  waiting up to 5 minutes ...");
+
+    // Wait for the peer to accept → state Ready
+    let timeout = Duration::from_secs(300);
+    let deadline = std::time::Instant::now() + timeout;
+
+    loop {
+        match request.state() {
+            VerificationRequestState::Ready { .. } => break,
+            VerificationRequestState::Done => return Ok(true),
+            VerificationRequestState::Cancelled(info) => {
+                return Err(anyhow!("verification cancelled: {:?}", info));
+            }
+            _ => {}
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = request.cancel().await;
+            return Err(anyhow!("timed out waiting for another device to accept"));
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    let sas = request
+        .start_sas()
+        .await
+        .context("start_sas")?
+        .ok_or_else(|| anyhow!("peer did not support SAS"))?;
+
+    // Wait for emojis to become available.
+    loop {
+        if let Some(emoji) = sas.emoji() {
+            println!();
+            println!("compare these emojis with the other device:");
+            for e in &emoji {
+                println!("  {} ({})", e.symbol, e.description);
+            }
+            println!();
+            break;
+        }
+        match sas.state() {
+            SasState::Cancelled(info) => {
+                return Err(anyhow!("SAS cancelled: {:?}", info));
+            }
+            SasState::Done { .. } => return Ok(true),
+            _ => {}
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    use std::io::Write;
+    eprint!("do they match? [y/N] ");
+    std::io::stderr().flush().ok();
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer).context("read answer")?;
+    if !answer.trim().eq_ignore_ascii_case("y") {
+        let _ = sas.cancel().await;
+        return Err(anyhow!("user answered no — verification cancelled"));
+    }
+
+    sas.confirm().await.context("confirm SAS")?;
+
+    // Wait for SDK to finalise (receive MAC from peer, accept, mark trusted).
+    let finish_deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        match sas.state() {
+            SasState::Done { .. } => return Ok(true),
+            SasState::Cancelled(info) => {
+                return Err(anyhow!("SAS cancelled after confirm: {:?}", info));
+            }
+            _ => {}
+        }
+        if std::time::Instant::now() > finish_deadline {
+            return Err(anyhow!("SAS did not finalise within 60s after confirm"));
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
 pub async fn whoami(http: &reqwest::Client, homeserver: &str, token: &str) -> Result<WhoAmI> {
     let url = format!("{homeserver}/_matrix/client/v3/account/whoami");
     let resp = http
