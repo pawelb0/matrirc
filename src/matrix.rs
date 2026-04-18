@@ -289,7 +289,7 @@ async fn backfill(
     out
 }
 
-async fn build_client_restored(cfg: &Config) -> Result<Client> {
+pub async fn build_client_restored(cfg: &Config) -> Result<Client> {
     let store = store_path()?;
     ensure_secret_dir(&store)?;
     let client = Client::builder()

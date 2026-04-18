@@ -25,6 +25,7 @@ async fn main() -> Result<()> {
         }
         Command::BootstrapE2ee => matrix::bootstrap_e2ee(cli::read_recovery_key()?).await,
         Command::Reset { force } => cli::reset(force),
+        Command::Verify => cli::verify().await,
         Command::Status => cli::status(),
         Command::Stop => cli::stop(),
     }

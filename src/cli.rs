@@ -60,6 +60,10 @@ pub enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Re-run SAS emoji verification against another device. Use this if
+    /// the `matrirc login` SAS prompt timed out or your peer device was
+    /// offline at that moment.
+    Verify,
     /// Report whether a matrirc daemon is currently running.
     Status,
     /// Stop the running daemon (SIGTERM).
@@ -168,6 +172,19 @@ fn read_secret(env: &str, label: &str) -> Result<String> {
         return Err(anyhow!("empty {label} on stdin"));
     }
     Ok(t)
+}
+
+pub async fn verify() -> Result<()> {
+    let cfg_path = config_path()?;
+    let cfg = crate::config::Config::load(&cfg_path)
+        .with_context(|| format!("load config {}", cfg_path.display()))?;
+    let client = matrix::build_client_restored(&cfg).await?;
+    match matrix::run_sas_bootstrap(&client).await {
+        Ok(true) => println!("✓ device verified."),
+        Ok(false) => println!("device already trusted — nothing to do."),
+        Err(e) => return Err(e),
+    }
+    Ok(())
 }
 
 pub fn status() -> Result<()> {
