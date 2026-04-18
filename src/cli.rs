@@ -179,10 +179,20 @@ pub async fn verify() -> Result<()> {
     let cfg = crate::config::Config::load(&cfg_path)
         .with_context(|| format!("load config {}", cfg_path.display()))?;
     let client = matrix::build_client_restored(&cfg).await?;
-    match matrix::run_sas_bootstrap(&client).await {
+
+    let sas_outcome = matrix::run_sas_bootstrap(&client).await;
+    match &sas_outcome {
         Ok(true) => println!("✓ device verified."),
-        Ok(false) => println!("device already trusted — nothing to do."),
-        Err(e) => return Err(e),
+        Ok(false) => println!("device already trusted."),
+        Err(e) => println!("× SAS verification failed: {e}"),
+    }
+
+    println!();
+    println!("checking what we have ...");
+    matrix::print_encryption_state_and_try_recover(&client).await;
+
+    if matches!(sas_outcome, Err(_)) {
+        return sas_outcome.map(|_| ());
     }
     Ok(())
 }

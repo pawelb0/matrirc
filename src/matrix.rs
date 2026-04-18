@@ -708,6 +708,59 @@ fn hostname() -> Option<String> {
 /// Runs SAS emoji verification against another already-verified device.
 /// Returns `Ok(true)` on successful verification, `Ok(false)` if the device was
 /// already trusted and no action was needed, Err on failure/timeout/cancel.
+pub async fn print_encryption_state_and_try_recover(client: &Client) {
+    use matrix_sdk::encryption::recovery::RecoveryState;
+    use std::time::Duration;
+
+    // A couple of short extra syncs to catch any to-device secret-send the peer
+    // emitted as part of verification.
+    for _ in 0..3 {
+        if let Err(e) = client.sync_once(SyncSettings::default().timeout(Duration::from_secs(10))).await {
+            warn!("post-verify sync failed: {e:#}");
+            break;
+        }
+    }
+
+    let verified = match client.encryption().get_own_device().await {
+        Ok(Some(d)) => d.is_verified(),
+        _ => false,
+    };
+    let recovery_state = client.encryption().recovery().state();
+    let backup_on_server = client.encryption().backups().are_enabled().await;
+
+    println!("  device cross-signed:     {}", if verified { "yes" } else { "no" });
+    println!("  server-side key backup:  {}", if backup_on_server { "exists" } else { "none" });
+    println!("  local recovery state:    {:?}", recovery_state);
+
+    match recovery_state {
+        RecoveryState::Enabled => {
+            println!();
+            println!("✓ local device has the backup key. Encrypted rooms should decrypt.");
+            println!("  If old messages still look encrypted, /part + /join that channel in irssi");
+            println!("  to retry key download.");
+        }
+        RecoveryState::Incomplete => {
+            println!();
+            println!("local secrets are partial. This usually means your peer device didn't");
+            println!("secret-share the backup key after verification. Options:");
+            println!("  1. On the verified Element device, open the matrirc session again and");
+            println!("     tap 'Share session keys' if that option appears.");
+            println!("  2. matrirc bootstrap-e2ee   (paste recovery key to import directly)");
+        }
+        RecoveryState::Disabled => {
+            println!();
+            println!("account-level recovery is disabled. Encrypted rooms CANNOT decrypt");
+            println!("history via this device. Set up key backup from Element first, then");
+            println!("retry matrirc login.");
+        }
+        RecoveryState::Unknown => {
+            println!();
+            println!("recovery state unknown — SDK is still waiting for server data.");
+            println!("Try again in a minute, or run `matrirc bootstrap-e2ee` with your recovery key.");
+        }
+    }
+}
+
 pub async fn run_sas_bootstrap(client: &Client) -> Result<bool> {
     use std::time::Duration;
     use matrix_sdk::encryption::verification::{SasState, VerificationRequestState};
