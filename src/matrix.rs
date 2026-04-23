@@ -89,7 +89,7 @@ fn sanitize_nick(s: &str) -> String {
     for c in s.chars() {
         if c.is_ascii_alphanumeric() || "-_|[]{}".contains(c) {
             out.push(c);
-        } else if out.chars().last() != Some('_') {
+        } else if !out.ends_with('_') {
             out.push('_');
         }
     }
@@ -175,6 +175,30 @@ fn strip_reply_fallback(body: &str) -> String {
     }
 }
 
+async fn send_to_room(
+    client: &Client,
+    bridge: &Bridge,
+    room_id: &matrix_sdk::ruma::RoomId,
+    body: &str,
+) {
+    let Some(room) = client.get_room(room_id) else {
+        warn!("matrix room not found: {room_id}");
+        return;
+    };
+    let content = RoomMessageEventContent::text_plain(body);
+    match room.send(content).await {
+        Ok(resp) => bridge.note_sent_by_us(resp.event_id),
+        Err(e) => {
+            warn!(%room_id, "matrix send failed: {e:#}");
+            let _ = bridge.from_matrix.send(FromMatrix::Message {
+                room: room_id.to_owned(),
+                sender_nick: "matrirc".into(),
+                body: format!("[send failed: {e}]"),
+            });
+        }
+    }
+}
+
 async fn fetch_members(client: &Client, room_id: &matrix_sdk::ruma::RoomId) -> Vec<String> {
     let Some(room) = client.get_room(room_id) else { return Vec::new(); };
     let members = match room.members(RoomMemberships::JOIN).await {
@@ -199,12 +223,10 @@ async fn dm_peer_nick(client: &Client, room: &Room) -> Option<String> {
         .members(RoomMemberships::JOIN | RoomMemberships::INVITE)
         .await
         .ok()?;
-    for m in members {
-        if m.user_id() != me {
-            return Some(mxid_localpart(m.user_id().as_str()).to_string());
-        }
-    }
-    None
+    members
+        .into_iter()
+        .find(|m| m.user_id() != me)
+        .map(|m| mxid_localpart(m.user_id().as_str()).to_string())
 }
 
 async fn backfill(
@@ -290,30 +312,37 @@ async fn backfill(
 }
 
 pub async fn build_client_restored(cfg: &Config) -> Result<Client> {
+    let client = new_client(&cfg.homeserver_url).await?;
+    client
+        .matrix_auth()
+        .restore_session(session_from_cfg(cfg)?, RoomLoadSettings::default())
+        .await
+        .context("restore session")?;
+    Ok(client)
+}
+
+async fn new_client(homeserver: &str) -> Result<Client> {
     let store = store_path()?;
     ensure_secret_dir(&store)?;
-    let client = Client::builder()
-        .homeserver_url(&cfg.homeserver_url)
+    Client::builder()
+        .homeserver_url(homeserver)
         .sqlite_store(&store, None)
         .build()
         .await
-        .context("build matrix client")?;
+        .context("build matrix client")
+}
+
+fn session_from_cfg(cfg: &Config) -> Result<MatrixSession> {
     let user_id = matrix_sdk::ruma::OwnedUserId::try_from(cfg.mxid.as_str())
         .with_context(|| format!("parse mxid {}", cfg.mxid))?;
     let device_id = matrix_sdk::ruma::OwnedDeviceId::from(cfg.device_id.as_str());
-    let session = MatrixSession {
+    Ok(MatrixSession {
         meta: SessionMeta { user_id, device_id },
         tokens: SessionTokens {
             access_token: cfg.access_token.clone(),
             refresh_token: None,
         },
-    };
-    client
-        .matrix_auth()
-        .restore_session(session, RoomLoadSettings::default())
-        .await
-        .context("restore session")?;
-    Ok(client)
+    })
 }
 
 pub async fn bootstrap_e2ee(recovery_key: String) -> Result<()> {
@@ -322,21 +351,13 @@ pub async fn bootstrap_e2ee(recovery_key: String) -> Result<()> {
         .with_context(|| format!("load config {}", cfg_path.display()))?;
     let store = store_path()?;
 
-    println!("matrirc bootstrap-e2ee");
-    println!("  homeserver:   {}", cfg.homeserver_url);
-    println!("  user:         {}", cfg.mxid);
-    println!("  device:       {}", cfg.device_id);
-    println!("  crypto store: {} (will be mode 0700)", store.display());
-    println!();
+    println!("bootstrap-e2ee: {} on {}", cfg.mxid, cfg.homeserver_url);
 
-    info!("bootstrap-e2ee: building client");
     let client = build_client_restored(&cfg).await?;
-    info!("bootstrap-e2ee: running initial sync so the olm machine is ready");
     client
         .sync_once(SyncSettings::default())
         .await
         .context("initial sync")?;
-    info!("bootstrap-e2ee: opening secret storage with recovery key");
     client
         .encryption()
         .recovery()
@@ -345,34 +366,21 @@ pub async fn bootstrap_e2ee(recovery_key: String) -> Result<()> {
         .context("recover with recovery key")?;
     drop(recovery_key);
 
-    info!("bootstrap-e2ee: self-signing this device with the imported self-signing key");
+    // Self-sign with the imported self-signing key so other clients trust us
+    // enough to share megolm sessions.
     let verified = match client.encryption().get_own_device().await.context("get own device")? {
-        Some(device) => match device.verify().await {
-            Ok(()) => true,
-            Err(e) => {
-                warn!("self-sign failed (other clients may refuse key share): {e}");
-                false
-            }
-        },
-        None => {
-            warn!("own device not found in crypto store");
-            false
-        }
+        Some(device) => device.verify().await.is_ok(),
+        None => false,
     };
 
-    println!("✓ secrets imported (cross-signing + message-key backup)");
-    if verified {
-        println!("✓ device self-signed and marked verified");
-    } else {
-        println!("✗ device self-signing failed — see log above");
-    }
+    println!("✓ secrets imported");
+    println!("{} device verified", if verified { "✓" } else { "✗" });
     println!();
-    println!("what is stored:");
-    println!("  {:<34} (access token, mode 0600)", cfg_path.display().to_string());
-    println!("  {:<34} (sqlite crypto store, mode 0700)", store.display().to_string());
-    println!("  (recovery key is NOT stored anywhere — scrubbed from memory after import)");
-    println!();
-    println!("next: restart the daemon (pkill matrirc; cargo run) — new messages will decrypt.");
+    println!("stored:");
+    println!("  {}  (token, 0600)", cfg_path.display());
+    println!("  {}  (crypto store, 0700)", store.display());
+    println!("recovery key not persisted.");
+    println!("next: restart daemon.");
     Ok(())
 }
 
@@ -410,40 +418,11 @@ pub async fn run_sync(
     name_store: Arc<NameStore>,
     env_override_room: Option<matrix_sdk::ruma::OwnedRoomId>,
 ) -> Result<()> {
-    let store = store_path()?;
-    ensure_secret_dir(&store)?;
-
-    let client = Client::builder()
-        .homeserver_url(&cfg.homeserver_url)
-        .sqlite_store(&store, None)
-        .build()
-        .await
-        .context("build matrix client")?;
-
-    let user_id = matrix_sdk::ruma::OwnedUserId::try_from(cfg.mxid.as_str())
-        .with_context(|| format!("parse mxid {}", cfg.mxid))?;
-    let device_id = matrix_sdk::ruma::OwnedDeviceId::from(cfg.device_id.as_str());
-
-    let session = MatrixSession {
-        meta: SessionMeta { user_id, device_id },
-        tokens: SessionTokens {
-            access_token: cfg.access_token.clone(),
-            refresh_token: None,
-        },
-    };
-    client
-        .matrix_auth()
-        .restore_session(session, RoomLoadSettings::default())
-        .await
-        .context("restore session")?;
-
-    info!("matrix: session restored, running initial sync");
-
+    let client = build_client_restored(&cfg).await?;
     let initial = client
         .sync_once(SyncSettings::default())
         .await
         .context("initial sync")?;
-    info!("matrix: initial sync done (next_batch={})", initial.next_batch);
 
     for room in client.rooms() {
         let name = room
@@ -507,17 +486,15 @@ pub async fn run_sync(
     info!(
         channels = bridge.snapshot().len(),
         dms = bridge.dm_count(),
-        "matrix: bridge populated"
+        "bridge populated; starting sync loop"
     );
-    info!("matrix: starting incremental sync loop");
 
     let bridge_for_topic = bridge.clone();
     client.add_event_handler(move |ev: SyncRoomTopicEvent, room: Room| {
         let bridge = bridge_for_topic.clone();
         async move {
-            let Some(orig) = ev.as_original() else { return; };
-            if bridge.update_topic(room.room_id(), orig.content.topic.clone()).is_none() {
-                return;
+            if let Some(orig) = ev.as_original() {
+                bridge.update_topic(room.room_id(), orig.content.topic.clone());
             }
         }
     });
@@ -539,8 +516,7 @@ pub async fn run_sync(
         }
     });
 
-    // Fallback for events the SDK could not decrypt: emit a visible placeholder so
-    // users see "something was said" instead of silence.
+    // UTD path: SDK couldn't decrypt; surface a placeholder so the user sees activity.
     let bridge_for_utd = bridge.clone();
     client.add_event_handler(move |ev: SyncRoomEncryptedEvent, room: Room| {
         let bridge = bridge_for_utd.clone();
@@ -567,8 +543,8 @@ pub async fn run_sync(
                 return;
             }
             let Some(orig) = ev.as_original() else { return; };
-            // Suppress only events we just sent from IRC, identified by event ID.
-            // Other devices' messages from the same MXID still flow through.
+            // Only suppress our own IRC-originated sends (matched by event id).
+            // Messages from other devices on the same MXID still flow through.
             if bridge.take_if_sent_by_us(&orig.event_id) {
                 return;
             }
@@ -591,34 +567,15 @@ pub async fn run_sync(
     tokio::spawn(async move {
         while let Some(cmd) = to_matrix.recv().await {
             match cmd {
-                ToMatrix::Send { room, body } => match send_client.get_room(&room) {
-                    Some(r) => {
-                        info!(%room, bytes = body.len(), encrypted = ?r.encryption_state(), "matrix: sending");
-                        let content = RoomMessageEventContent::text_plain(&body);
-                        match r.send(content).await {
-                            Ok(resp) => {
-                                info!(%room, event = %resp.event_id, "matrix: sent");
-                                send_bridge.note_sent_by_us(resp.event_id);
-                            }
-                            Err(e) => {
-                                warn!(%room, "matrix send failed: {e:#}");
-                                let _ = send_bridge.from_matrix.send(FromMatrix::Message {
-                                    room: room.clone(),
-                                    sender_nick: "matrirc".into(),
-                                    body: format!("[send failed: {e}]"),
-                                });
-                            }
-                        }
-                    }
-                    None => warn!("matrix room not found: {room}"),
-                },
+                ToMatrix::Send { room, body } => {
+                    send_to_room(&send_client, &send_bridge, &room, &body).await;
+                }
                 ToMatrix::Backfill { room, limit, reply } => {
                     let result = backfill(&send_client, &room, limit, &homeserver_for_sender).await;
                     let _ = reply.send(result);
                 }
                 ToMatrix::Members { room, reply } => {
-                    let result = fetch_members(&send_client, &room).await;
-                    let _ = reply.send(result);
+                    let _ = reply.send(fetch_members(&send_client, &room).await);
                 }
             }
         }
@@ -705,15 +662,12 @@ fn hostname() -> Option<String> {
     })
 }
 
-/// Runs SAS emoji verification against another already-verified device.
-/// Returns `Ok(true)` on successful verification, `Ok(false)` if the device was
-/// already trusted and no action was needed, Err on failure/timeout/cancel.
+/// Prints encryption posture + hints. Runs a few short extra syncs first to
+/// catch any to-device secret-send that arrived around verification time.
 pub async fn print_encryption_state_and_try_recover(client: &Client) {
     use matrix_sdk::encryption::recovery::RecoveryState;
     use std::time::Duration;
 
-    // A couple of short extra syncs to catch any to-device secret-send the peer
-    // emitted as part of verification.
     for _ in 0..3 {
         if let Err(e) = client.sync_once(SyncSettings::default().timeout(Duration::from_secs(10))).await {
             warn!("post-verify sync failed: {e:#}");
@@ -721,101 +675,70 @@ pub async fn print_encryption_state_and_try_recover(client: &Client) {
         }
     }
 
-    let verified = match client.encryption().get_own_device().await {
-        Ok(Some(d)) => d.is_verified(),
-        _ => false,
-    };
-    let recovery_state = client.encryption().recovery().state();
+    let verified = matches!(client.encryption().get_own_device().await, Ok(Some(d)) if d.is_verified());
     let backup_on_server = client.encryption().backups().are_enabled().await;
+    let recovery_state = client.encryption().recovery().state();
 
     println!("  device cross-signed:     {}", if verified { "yes" } else { "no" });
     println!("  server-side key backup:  {}", if backup_on_server { "exists" } else { "none" });
     println!("  local recovery state:    {:?}", recovery_state);
-
+    println!();
     match recovery_state {
         RecoveryState::Enabled => {
-            println!();
-            println!("✓ local device has the backup key. Encrypted rooms should decrypt.");
-            println!("  If old messages still look encrypted, /part + /join that channel in irssi");
-            println!("  to retry key download.");
+            println!("✓ backup key present. /part+/join an encrypted channel to pull old keys.");
         }
         RecoveryState::Incomplete => {
-            println!();
-            println!("local secrets are partial. This usually means your peer device didn't");
-            println!("secret-share the backup key after verification. Options:");
-            println!("  1. On the verified Element device, open the matrirc session again and");
-            println!("     tap 'Share session keys' if that option appears.");
-            println!("  2. matrirc bootstrap-e2ee   (paste recovery key to import directly)");
+            println!("partial secrets. Options:");
+            println!("  - Element → open matrirc session → 'Share session keys'");
+            println!("  - matrirc bootstrap-e2ee   (import via recovery key)");
         }
         RecoveryState::Disabled => {
-            println!();
-            println!("account-level recovery is disabled. Encrypted rooms CANNOT decrypt");
-            println!("history via this device. Set up key backup from Element first, then");
-            println!("retry matrirc login.");
+            println!("account has no key backup — no way to pull old megolm keys.");
+            println!("Set up key backup in Element, then retry login.");
         }
         RecoveryState::Unknown => {
-            println!();
-            println!("recovery state unknown — SDK is still waiting for server data.");
-            println!("Try again in a minute, or run `matrirc bootstrap-e2ee` with your recovery key.");
+            println!("state still resolving — try again shortly or run bootstrap-e2ee.");
         }
     }
 }
 
+/// Runs SAS emoji verification against another already-verified device.
+/// `Ok(true)` on success, `Ok(false)` if already trusted, `Err` on failure.
 pub async fn run_sas_bootstrap(client: &Client) -> Result<bool> {
-    use std::time::Duration;
     use matrix_sdk::encryption::verification::{SasState, VerificationRequestState};
+    use std::time::Duration;
 
-    info!("sync_once before SAS");
     client
         .sync_once(SyncSettings::default())
         .await
         .context("initial sync")?;
 
-    let own_id = client.user_id().ok_or_else(|| anyhow!("no user id"))?.to_owned();
-    let already_trusted = match client.encryption().get_own_device().await {
-        Ok(Some(dev)) => dev.is_verified(),
-        _ => false,
-    };
-    if already_trusted {
+    if matches!(client.encryption().get_own_device().await, Ok(Some(d)) if d.is_verified()) {
         return Ok(false);
     }
 
+    let own_id = client.user_id().ok_or_else(|| anyhow!("no user id"))?.to_owned();
     let identity = client
         .encryption()
         .request_user_identity(&own_id)
         .await
         .context("request own identity")?
-        .ok_or_else(|| anyhow!("no cross-signing identity yet — has another Element session set up key backup?"))?;
-
+        .ok_or_else(|| anyhow!("no cross-signing identity — set up key backup in Element first"))?;
     let request = identity
         .request_verification()
         .await
         .context("start verification request")?;
 
-    println!("matrirc is asking another of your devices to verify this one.");
-    println!("→ open Element (phone/desktop) → accept the verification request from device {:?}",
-        device_display_name());
-    println!("  waiting up to 5 minutes ...");
+    println!("matrirc sent a verification request.");
+    println!("→ Element → Settings → Sessions → {} → Verify. Waiting 5 min ...", device_display_name());
 
-    // Wait for the peer to accept → state Ready
-    let timeout = Duration::from_secs(300);
-    let deadline = std::time::Instant::now() + timeout;
-
-    loop {
-        match request.state() {
-            VerificationRequestState::Ready { .. } => break,
-            VerificationRequestState::Done => return Ok(true),
-            VerificationRequestState::Cancelled(info) => {
-                return Err(anyhow!("verification cancelled: {:?}", info));
-            }
-            _ => {}
-        }
-        if std::time::Instant::now() > deadline {
-            let _ = request.cancel().await;
-            return Err(anyhow!("timed out waiting for another device to accept"));
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
+    wait_until(&request, Duration::from_secs(300), |r| match r.state() {
+        VerificationRequestState::Ready { .. } => Some(Ok(false)),
+        VerificationRequestState::Done => Some(Ok(true)),
+        VerificationRequestState::Cancelled(info) => Some(Err(anyhow!("cancelled: {:?}", info))),
+        _ => None,
+    })
+    .await??;
 
     let sas = request
         .start_sas()
@@ -823,53 +746,55 @@ pub async fn run_sas_bootstrap(client: &Client) -> Result<bool> {
         .context("start_sas")?
         .ok_or_else(|| anyhow!("peer did not support SAS"))?;
 
-    // Wait for emojis to become available.
-    loop {
-        if let Some(emoji) = sas.emoji() {
-            println!();
-            println!("compare these emojis with the other device:");
-            for e in &emoji {
-                println!("  {} ({})", e.symbol, e.description);
-            }
-            println!();
-            break;
+    wait_until(&sas, Duration::from_secs(60), |s| match s.state() {
+        SasState::Cancelled(info) => Some(Err(anyhow!("SAS cancelled: {:?}", info))),
+        SasState::Done { .. } => Some(Ok(true)),
+        _ => s.emoji().map(|_| Ok(false)),
+    })
+    .await??;
+
+    if let Some(emoji) = sas.emoji() {
+        println!();
+        println!("compare with the other device:");
+        for e in &emoji {
+            println!("  {} ({})", e.symbol, e.description);
         }
-        match sas.state() {
-            SasState::Cancelled(info) => {
-                return Err(anyhow!("SAS cancelled: {:?}", info));
-            }
-            SasState::Done { .. } => return Ok(true),
-            _ => {}
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        println!();
     }
 
     use std::io::Write;
-    eprint!("do they match? [y/N] ");
+    eprint!("match? [y/N] ");
     std::io::stderr().flush().ok();
     let mut answer = String::new();
     std::io::stdin().read_line(&mut answer).context("read answer")?;
     if !answer.trim().eq_ignore_ascii_case("y") {
         let _ = sas.cancel().await;
-        return Err(anyhow!("user answered no — verification cancelled"));
+        return Err(anyhow!("user cancelled"));
     }
-
     sas.confirm().await.context("confirm SAS")?;
 
-    // Wait for SDK to finalise (receive MAC from peer, accept, mark trusted).
-    let finish_deadline = std::time::Instant::now() + Duration::from_secs(60);
+    wait_until(&sas, Duration::from_secs(60), |s| match s.state() {
+        SasState::Done { .. } => Some(Ok(true)),
+        SasState::Cancelled(info) => Some(Err(anyhow!("cancelled after confirm: {:?}", info))),
+        _ => None,
+    })
+    .await?
+}
+
+async fn wait_until<T, R>(
+    item: &T,
+    timeout: std::time::Duration,
+    mut check: impl FnMut(&T) -> Option<R>,
+) -> Result<R> {
+    let deadline = std::time::Instant::now() + timeout;
     loop {
-        match sas.state() {
-            SasState::Done { .. } => return Ok(true),
-            SasState::Cancelled(info) => {
-                return Err(anyhow!("SAS cancelled after confirm: {:?}", info));
-            }
-            _ => {}
+        if let Some(r) = check(item) {
+            return Ok(r);
         }
-        if std::time::Instant::now() > finish_deadline {
-            return Err(anyhow!("SAS did not finalise within 60s after confirm"));
+        if std::time::Instant::now() > deadline {
+            return Err(anyhow!("timed out after {timeout:?}"));
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
 }
 

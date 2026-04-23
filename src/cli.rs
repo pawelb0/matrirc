@@ -191,7 +191,7 @@ pub async fn verify() -> Result<()> {
     println!("checking what we have ...");
     matrix::print_encryption_state_and_try_recover(&client).await;
 
-    if matches!(sas_outcome, Err(_)) {
+    if sas_outcome.is_err() {
         return sas_outcome.map(|_| ());
     }
     Ok(())
