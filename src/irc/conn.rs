@@ -145,7 +145,17 @@ async fn handle_command(
     let p0 = msg.params.first().map(String::as_str);
     match msg.command.as_str() {
         "CAP" => handle_cap(write, msg, &mut s.caps).await?,
-        "NICK" => if let Some(n) = p0 { s.nick = Some(n.into()); },
+        "NICK" => if let Some(n) = p0 {
+            let new = n.to_string();
+            let old = s.nick.replace(new.clone());
+            if s.registered {
+                if let Some(prev) = old.filter(|p| p != &new) {
+                    let prefix = format!("{prev}!{prev}@matrirc.local");
+                    send(write, Message::with_prefix(&prefix, "NICK", vec![new.clone()])).await?;
+                    let _ = bridge.to_matrix.try_send(ToMatrix::SetDisplayName { name: new });
+                }
+            }
+        },
         "USER" => if let Some(u) = p0 { s.user = Some(u.into()); },
         "PING" => send(write, srv("PONG", vec![SERVER_NAME.into(), p0.unwrap_or("").into()])).await?,
         "JOIN" => if let Some(n) = s.nick.clone() {
@@ -1001,6 +1011,28 @@ mod tests {
         let mut s = registered_state("pawelb");
         let out = dispatch("PRIVMSG matrirc :\x01ACTION waves\x01", &b, &mut s).await;
         assert!(out.is_empty(), "bot should not emit for CTCP: {out:?}");
+    }
+
+    #[tokio::test]
+    async fn nick_post_registration_echoes_and_routes_to_matrix() {
+        let (b, mut rx) = Bridge::new(Mapping::default());
+        let mut s = registered_state("pawelb");
+        let out = dispatch("NICK newnick", &b, &mut s).await;
+        assert_eq!(out, ":pawelb!pawelb@matrirc.local NICK newnick\r\n");
+        assert_eq!(s.nick.as_deref(), Some("newnick"));
+        match rx.try_recv() {
+            Ok(ToMatrix::SetDisplayName { name }) => assert_eq!(name, "newnick"),
+            other => panic!("expected SetDisplayName, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn nick_same_value_is_noop() {
+        let (b, mut rx) = Bridge::new(Mapping::default());
+        let mut s = registered_state("pawelb");
+        let out = dispatch("NICK pawelb", &b, &mut s).await;
+        assert!(out.is_empty(), "{out:?}");
+        assert!(rx.try_recv().is_err(), "no SetDisplayName for same nick");
     }
 
     #[tokio::test]

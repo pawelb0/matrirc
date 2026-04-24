@@ -110,6 +110,9 @@ pub enum ToMatrix {
         nick: String,
         reply: oneshot::Sender<Option<WhoisInfo>>,
     },
+    SetDisplayName {
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone)]

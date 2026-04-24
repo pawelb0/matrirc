@@ -728,6 +728,11 @@ pub async fn run_sync(
                 ToMatrix::Whois { nick, reply } => {
                     let _ = reply.send(whois_lookup(&send_client, &nick).await);
                 }
+                ToMatrix::SetDisplayName { name } => {
+                    if let Err(e) = send_client.account().set_display_name(Some(&name)).await {
+                        warn!("set display name: {e:#}");
+                    }
+                }
             }
         }
     });
