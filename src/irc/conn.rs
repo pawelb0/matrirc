@@ -35,16 +35,20 @@ fn user_prefix(nick: &str) -> String {
     format!("{nick}!{nick}@matrirc.local")
 }
 
+#[derive(Default)]
+struct State {
+    nick: Option<String>,
+    user: Option<String>,
+    registered: bool,
+    joined: HashSet<String>,
+    caps: HashSet<String>,
+}
+
 pub async fn handle(sock: TcpStream, peer: SocketAddr, bridge: Bridge) -> Result<()> {
     let (read, mut write) = sock.into_split();
     let mut lines = BufReader::new(read).lines();
     let mut from_matrix = bridge.from_matrix.subscribe();
-
-    let mut nick: Option<String> = None;
-    let mut user: Option<String> = None;
-    let mut registered = false;
-    let mut joined: HashSet<String> = HashSet::new();
-    let mut caps_enabled: HashSet<String> = HashSet::new();
+    let mut s = State::default();
 
     loop {
         tokio::select! {
@@ -52,128 +56,105 @@ pub async fn handle(sock: TcpStream, peer: SocketAddr, bridge: Bridge) -> Result
                 let Some(line) = line_res? else { break; };
                 let msg = match Message::parse(&line) {
                     Ok(m) => m,
-                    Err(e) => {
-                        debug!(%peer, error = %e, raw = %line, "skipping malformed line");
-                        continue;
-                    }
+                    Err(e) => { debug!(%peer, error = %e, "bad line"); continue; }
                 };
-                if handle_command(&mut write, &peer, &bridge, &msg, &mut nick, &mut user, &mut joined, &mut caps_enabled).await? {
-                    return Ok(());
-                }
-                if !registered {
-                    if let (Some(n), Some(_)) = (&nick, &user) {
-                        send_welcome(&mut write, n).await?;
-                        registered = true;
-                        auto_join_all(&mut write, n, &bridge, &mut joined, &caps_enabled).await?;
+                if handle_command(&mut write, &peer, &bridge, &msg, &mut s).await? { return Ok(()); }
+                if !s.registered {
+                    if let (Some(n), Some(_)) = (s.nick.clone(), s.user.clone()) {
+                        send_welcome(&mut write, &n).await?;
+                        s.registered = true;
+                        auto_join_all(&mut write, &n, &bridge, &mut s.joined, &s.caps).await?;
                     }
                 }
             }
             ev = from_matrix.recv() => {
                 match ev {
-                    Ok(FromMatrix::Message { room, sender_nick, body }) => {
-                        let target = if let Some(chan) = bridge.chan_for(&room) {
-                            if !joined.contains(&chan) { continue; }
-                            chan
-                        } else if bridge.dm_nick_for(&room).is_some() {
-                            // DM: deliver to the client's own nick so irssi opens a query window
-                            match nick.as_deref() { Some(n) => n.to_string(), None => continue }
-                        } else {
-                            continue;
-                        };
-                        let prefix = format!("{sender_nick}!{sender_nick}@matrix");
-                        for piece in body.split('\n') {
-                            if piece.is_empty() { continue; }
-                            send(&mut write, Message::with_prefix(&prefix, "PRIVMSG", vec![target.clone(), piece.to_string()])).await?;
-                        }
-                    }
-                    Ok(FromMatrix::RoomAdded { room, chan, topic }) => {
-                        if !registered {
-                            continue;
-                        }
-                        if joined.contains(&chan) { continue; }
-                        if let Some(n) = nick.as_deref() {
-                            join_bridged(&mut write, n, &chan, &room, &topic, &bridge, &caps_enabled).await?;
-                            joined.insert(chan);
-                        }
-                    }
-                    Ok(FromMatrix::DmAdded { nick: dm_nick }) => {
-                        if !registered { continue; }
-                        if let Some(n) = nick.as_deref() {
-                            matrirc_notice(&mut write, n, &format!("DM available: /msg {dm_nick} ...")).await?;
-                        }
-                    }
-                    Ok(FromMatrix::TopicChanged { chan, topic }) => {
-                        if registered && joined.contains(&chan) {
-                            send(&mut write, srv("TOPIC", vec![chan, topic])).await?;
-                        }
-                    }
+                    Ok(e) => handle_matrix_event(&mut write, &bridge, &mut s, e).await?,
                     Err(broadcast::error::RecvError::Closed) => break,
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        warn!(%peer, "irc client lagged {n} matrix events");
-                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => warn!(%peer, "lagged {n} events"),
                 }
             }
         }
     }
-
     info!(%peer, "client disconnected");
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+async fn handle_matrix_event(
+    write: &mut OwnedWriteHalf,
+    bridge: &Bridge,
+    s: &mut State,
+    ev: FromMatrix,
+) -> Result<()> {
+    match ev {
+        FromMatrix::Message { room, sender_nick, body } => {
+            let target = if let Some(chan) = bridge.chan_for(&room) {
+                if !s.joined.contains(&chan) { return Ok(()); }
+                chan
+            } else if bridge.dm_nick_for(&room).is_some() {
+                // DM: deliver to the client's own nick so irssi opens a query window
+                match s.nick.as_deref() { Some(n) => n.to_string(), None => return Ok(()) }
+            } else { return Ok(()); };
+            let prefix = format!("{sender_nick}!{sender_nick}@matrix");
+            for piece in body.split('\n').filter(|p| !p.is_empty()) {
+                send(write, Message::with_prefix(&prefix, "PRIVMSG", vec![target.clone(), piece.into()])).await?;
+            }
+        }
+        FromMatrix::RoomAdded { room, chan, topic } => {
+            if !s.registered || s.joined.contains(&chan) { return Ok(()); }
+            if let Some(n) = s.nick.as_deref() {
+                join_bridged(write, n, &chan, &room, &topic, bridge, &s.caps).await?;
+                s.joined.insert(chan);
+            }
+        }
+        FromMatrix::DmAdded { nick: dm } => {
+            if s.registered {
+                if let Some(n) = s.nick.as_deref() {
+                    matrirc_notice(write, n, &format!("DM available: /msg {dm} ...")).await?;
+                }
+            }
+        }
+        FromMatrix::TopicChanged { chan, topic } => {
+            if s.registered && s.joined.contains(&chan) {
+                send(write, srv("TOPIC", vec![chan, topic])).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn handle_command(
     write: &mut OwnedWriteHalf,
     peer: &SocketAddr,
     bridge: &Bridge,
     msg: &Message,
-    nick: &mut Option<String>,
-    user: &mut Option<String>,
-    joined: &mut HashSet<String>,
-    caps_enabled: &mut HashSet<String>,
+    s: &mut State,
 ) -> Result<bool> {
+    let p0 = msg.params.first().map(String::as_str);
     match msg.command.as_str() {
-        "CAP" => handle_cap(write, msg, caps_enabled).await?,
-        "NICK" => {
-            if let Some(n) = msg.params.first() {
-                *nick = Some(n.clone());
-            }
-        }
-        "USER" => {
-            if let Some(u) = msg.params.first() {
-                *user = Some(u.clone());
-            }
-        }
-        "PING" => {
-            let token = msg.params.first().cloned().unwrap_or_default();
-            send(write, srv("PONG", vec![SERVER_NAME.into(), token])).await?;
-        }
-        "JOIN" => {
-            if let Some(n) = nick.as_deref() {
-                handle_join(write, n, msg, joined, bridge, caps_enabled).await?;
-            }
-        }
-        "PART" => {
-            if let Some(n) = nick.as_deref() {
-                handle_part(write, n, msg, joined).await?;
-            }
-        }
-        "PRIVMSG" => {
-            if let Some(n) = nick.as_deref() {
-                handle_privmsg(write, n, msg, bridge).await?;
-            }
-        }
-        "WHOIS" => {
-            if let Some(n) = nick.as_deref() {
-                handle_whois(write, n, msg, bridge).await?;
-            }
-        }
-        "NOTICE" => debug!(?msg, "client NOTICE ignored"),
+        "CAP" => handle_cap(write, msg, &mut s.caps).await?,
+        "NICK" => if let Some(n) = p0 { s.nick = Some(n.into()); },
+        "USER" => if let Some(u) = p0 { s.user = Some(u.into()); },
+        "PING" => send(write, srv("PONG", vec![SERVER_NAME.into(), p0.unwrap_or("").into()])).await?,
+        "JOIN" => if let Some(n) = s.nick.clone() {
+            handle_join(write, &n, msg, &mut s.joined, bridge, &s.caps).await?;
+        },
+        "PART" => if let Some(n) = s.nick.clone() {
+            handle_part(write, &n, msg, &mut s.joined).await?;
+        },
+        "PRIVMSG" => if let Some(n) = s.nick.clone() {
+            handle_privmsg(write, &n, msg, bridge).await?;
+        },
+        "WHOIS" => if let Some(n) = s.nick.clone() {
+            handle_whois(write, &n, msg, bridge).await?;
+        },
+        "NOTICE" => {}
         "QUIT" => {
             let _ = write.shutdown().await;
             info!(%peer, "client quit");
             return Ok(true);
         }
-        other => debug!(%peer, command = %other, "ignoring unsupported command"),
+        other => debug!(%peer, %other, "unsupported"),
     }
     Ok(false)
 }
@@ -604,18 +585,12 @@ async fn handle_whois(
     }
     match rx.await.ok().flatten() {
         Some(info) => {
-            let realname = info.display_name.as_deref().unwrap_or(&info.mxid);
+            let realname = match &info.display_name {
+                Some(d) if d != &info.nick => format!("{d} ({})", info.mxid),
+                _ => info.mxid.clone(),
+            };
             let server_hint = info.mxid.rsplit_once(':').map(|(_, s)| s);
-            send_whois(
-                write,
-                nick,
-                &info.nick,
-                &info.nick,
-                "matrix",
-                realname,
-                server_hint,
-                &info.rooms,
-            ).await?;
+            send_whois(write, nick, &info.nick, &info.nick, "matrix", &realname, server_hint, &info.rooms).await?;
         }
         None => {
             send(write, srv("401", vec![nick.into(), target.clone(), "No such nick/channel".into()])).await?;
@@ -698,9 +673,11 @@ async fn handle_privmsg(
         return Ok(());
     }
 
-    // Explicit MXID target like `@alice:server.org` — open or create a DM.
-    if target.starts_with('@') {
-        if let Ok(mxid) = matrix_sdk::ruma::OwnedUserId::try_from(target.as_str()) {
+    // Explicit MXID target (`@alice:server.org` or bare `alice:server.org`) →
+    // open or create a DM. irssi strips leading '@' in /query, accept both.
+    if target.contains(':') {
+        let canonical = if target.starts_with('@') { target.clone() } else { format!("@{target}") };
+        if let Ok(mxid) = matrix_sdk::ruma::OwnedUserId::try_from(canonical.as_str()) {
             if let Err(e) = bridge.to_matrix.try_send(ToMatrix::SendToMxid { mxid, body: text.clone() }) {
                 warn!("dropping outbound DM to MXID: {e}");
                 send(write, srv("NOTICE", vec![nick.into(), format!("send dropped: {e}")])).await?;

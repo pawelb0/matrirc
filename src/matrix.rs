@@ -75,6 +75,26 @@ const C_RED: &str = "\x0305";
 const C_SILVER: &str = "\x0315";
 const C_RESET: &str = "\x0f";
 
+/// Returns the sender nick if the event should be forwarded, `None` to drop.
+async fn accept_event(
+    bridge: &Bridge,
+    room: &Room,
+    event_id: &matrix_sdk::ruma::EventId,
+    sender: &matrix_sdk::ruma::UserId,
+) -> Option<String> {
+    if !bridge.has_room(room.room_id()) { return None; }
+    if bridge.take_if_sent_by_us(event_id) { return None; }
+    Some(sender_nick(room, sender).await)
+}
+
+fn emit_message(bridge: &Bridge, room: &matrix_sdk::ruma::RoomId, nick: String, body: String) {
+    let _ = bridge.from_matrix.send(FromMatrix::Message {
+        room: room.to_owned(),
+        sender_nick: nick,
+        body,
+    });
+}
+
 async fn sender_nick(room: &Room, sender: &matrix_sdk::ruma::UserId) -> String {
     let display = match room.get_member_no_sync(sender).await {
         Ok(Some(m)) => m.display_name().map(ToOwned::to_owned),
@@ -308,34 +328,31 @@ async fn join_by_alias(
 async fn whois_lookup(client: &Client, nick: &str) -> Option<WhoisInfo> {
     let needle = nick.to_ascii_lowercase();
     let me = client.user_id()?;
-    let mut match_mxid: Option<matrix_sdk::ruma::OwnedUserId> = None;
-    let mut match_display: Option<String> = None;
+    let mut hit_mxid: Option<matrix_sdk::ruma::OwnedUserId> = None;
+    let mut hit_display: Option<String> = None;
     let mut rooms = Vec::new();
     for room in client.rooms() {
         let Ok(members) = room.members(RoomMemberships::JOIN).await else { continue };
         for m in members {
             if m.user_id() == me { continue; }
-            let display = m.display_name().map(|d| sanitize_nick(d));
-            let local = mxid_localpart(m.user_id().as_str()).to_string();
-            let hits = display.as_deref() == Some(nick)
-                || display.as_deref().map(str::to_ascii_lowercase).as_deref() == Some(&needle)
-                || local == nick
-                || local.to_ascii_lowercase() == needle;
-            if !hits { continue; }
-            if match_mxid.is_none() {
-                match_mxid = Some(m.user_id().to_owned());
-                match_display = m.display_name().map(ToOwned::to_owned);
+            let raw_display = m.display_name();
+            let matches = raw_display.map(sanitize_nick).as_deref().map(str::to_ascii_lowercase) == Some(needle.clone())
+                || mxid_localpart(m.user_id().as_str()).eq_ignore_ascii_case(nick);
+            if !matches { continue; }
+            if hit_mxid.is_none() {
+                hit_mxid = Some(m.user_id().to_owned());
+                hit_display = raw_display.map(ToOwned::to_owned);
             }
-            if match_mxid.as_deref() == Some(m.user_id()) {
+            if hit_mxid.as_deref() == Some(m.user_id()) {
                 let name = room.display_name().await.map(|n| n.to_string()).unwrap_or_default();
                 rooms.push(if name.is_empty() { room.room_id().to_string() } else { name });
             }
         }
     }
-    match_mxid.map(|mxid| WhoisInfo {
+    hit_mxid.map(|mxid| WhoisInfo {
         nick: nick.to_string(),
         mxid: mxid.to_string(),
-        display_name: match_display,
+        display_name: hit_display,
         rooms,
     })
 }
@@ -491,39 +508,22 @@ fn session_from_cfg(cfg: &Config) -> Result<MatrixSession> {
 
 pub async fn bootstrap_e2ee(recovery_key: String) -> Result<()> {
     let cfg_path = crate::config::config_path()?;
-    let cfg = Config::load(&cfg_path)
-        .with_context(|| format!("load config {}", cfg_path.display()))?;
-    let store = store_path()?;
-
+    let cfg = Config::load(&cfg_path).with_context(|| format!("load {}", cfg_path.display()))?;
     println!("bootstrap-e2ee: {} on {}", cfg.mxid, cfg.homeserver_url);
 
     let client = build_client_restored(&cfg).await?;
-    client
-        .sync_once(SyncSettings::default())
-        .await
-        .context("initial sync")?;
-    client
-        .encryption()
-        .recovery()
-        .recover(recovery_key.as_str())
-        .await
-        .context("recover with recovery key")?;
+    client.sync_once(SyncSettings::default()).await.context("initial sync")?;
+    client.encryption().recovery().recover(&recovery_key).await.context("recover")?;
     drop(recovery_key);
 
-    // Self-sign with the imported self-signing key so other clients trust us
-    // enough to share megolm sessions.
-    let verified = match client.encryption().get_own_device().await.context("get own device")? {
-        Some(device) => device.verify().await.is_ok(),
-        None => false,
-    };
+    // Self-sign with the imported self-signing key so other clients trust us.
+    let verified = matches!(
+        client.encryption().get_own_device().await.context("get own device")?,
+        Some(d) if d.verify().await.is_ok()
+    );
 
     println!("✓ secrets imported");
     println!("{} device verified", if verified { "✓" } else { "✗" });
-    println!();
-    println!("stored:");
-    println!("  {}  (token, 0600)", cfg_path.display());
-    println!("  {}  (crypto store, 0700)", store.display());
-    println!("recovery key not persisted.");
     println!("next: restart daemon.");
     Ok(())
 }
@@ -633,84 +633,59 @@ pub async fn run_sync(
         "bridge populated; starting sync loop"
     );
 
-    let bridge_for_topic = bridge.clone();
-    client.add_event_handler(move |ev: SyncRoomTopicEvent, room: Room| {
-        let bridge = bridge_for_topic.clone();
-        async move {
-            if let Some(orig) = ev.as_original() {
-                bridge.update_topic(room.room_id(), orig.content.topic.clone());
+    {
+        let bridge = bridge.clone();
+        client.add_event_handler(move |ev: SyncRoomTopicEvent, room: Room| {
+            let bridge = bridge.clone();
+            async move {
+                if let Some(orig) = ev.as_original() {
+                    bridge.update_topic(room.room_id(), orig.content.topic.clone());
+                }
             }
-        }
-    });
+        });
+    }
 
-
-    let bridge_for_reactions = bridge.clone();
-    client.add_event_handler(move |ev: SyncReactionEvent, room: Room| {
-        let bridge = bridge_for_reactions.clone();
-        async move {
-            if !bridge.has_room(room.room_id()) { return; }
-            let Some(orig) = ev.as_original() else { return; };
-            if bridge.take_if_sent_by_us(&orig.event_id) { return; }
-            let key = &orig.content.relates_to.key;
-            let nick = sender_nick(&room, &orig.sender).await;
-            let _ = bridge.from_matrix.send(FromMatrix::Message {
-                room: room.room_id().to_owned(),
-                sender_nick: nick.clone(),
-                body: format!("\x01ACTION reacted {key}\x01"),
-            });
-        }
-    });
+    {
+        let bridge = bridge.clone();
+        client.add_event_handler(move |ev: SyncReactionEvent, room: Room| {
+            let bridge = bridge.clone();
+            async move {
+                let Some(orig) = ev.as_original() else { return; };
+                let Some(nick) = accept_event(&bridge, &room, &orig.event_id, &orig.sender).await else { return; };
+                emit_message(&bridge, room.room_id(), nick,
+                    format!("\x01ACTION reacted {}\x01", orig.content.relates_to.key));
+            }
+        });
+    }
 
     // UTD path: SDK couldn't decrypt; surface a placeholder so the user sees activity.
-    let bridge_for_utd = bridge.clone();
-    client.add_event_handler(move |ev: SyncRoomEncryptedEvent, room: Room| {
-        let bridge = bridge_for_utd.clone();
-        async move {
-            let rid = room.room_id();
-            if !bridge.has_room(rid) {
-                tracing::debug!(%rid, "drop UTD: room not mapped");
-                return;
+    {
+        let bridge = bridge.clone();
+        client.add_event_handler(move |ev: SyncRoomEncryptedEvent, room: Room| {
+            let bridge = bridge.clone();
+            async move {
+                let Some(orig) = ev.as_original() else { return; };
+                let Some(nick) = accept_event(&bridge, &room, &orig.event_id, &orig.sender).await else { return; };
+                emit_message(&bridge, room.room_id(), nick,
+                    format!("{C_RED}[encrypted — run `matrirc bootstrap-e2ee` once to decrypt]{C_RESET}"));
             }
-            let Some(orig) = ev.as_original() else { return; };
-            if bridge.take_if_sent_by_us(&orig.event_id) { return; }
-            let nick = sender_nick(&room, &orig.sender).await;
-            tracing::info!(%rid, %nick, "inbound UTD (no key)");
-            let _ = bridge.from_matrix.send(FromMatrix::Message {
-                room: rid.to_owned(),
-                sender_nick: nick,
-                body: format!("{C_RED}[encrypted — run `matrirc bootstrap-e2ee` once to decrypt]{C_RESET}"),
-            });
-        }
-    });
+        });
+    }
 
-    let bridge_for_handler = bridge.clone();
-    let homeserver_for_handler = cfg.homeserver_url.clone();
-    client.add_event_handler(move |ev: SyncRoomMessageEvent, room: Room| {
-        let bridge = bridge_for_handler.clone();
-        let homeserver = homeserver_for_handler.clone();
-        async move {
-            let rid = room.room_id();
-            if !bridge.has_room(rid) {
-                tracing::debug!(%rid, "drop: room not mapped");
-                return;
+    {
+        let bridge = bridge.clone();
+        let homeserver = cfg.homeserver_url.clone();
+        client.add_event_handler(move |ev: SyncRoomMessageEvent, room: Room| {
+            let bridge = bridge.clone();
+            let homeserver = homeserver.clone();
+            async move {
+                let Some(orig) = ev.as_original() else { return; };
+                let Some(nick) = accept_event(&bridge, &room, &orig.event_id, &orig.sender).await else { return; };
+                let Some(body) = body_from_event(&orig.content, &homeserver) else { return; };
+                emit_message(&bridge, room.room_id(), nick, body);
             }
-            let Some(orig) = ev.as_original() else { return; };
-            if bridge.take_if_sent_by_us(&orig.event_id) {
-                return;
-            }
-            let Some(body) = body_from_event(&orig.content, &homeserver) else {
-                tracing::debug!(%rid, "drop: unsupported msgtype");
-                return;
-            };
-            let nick = sender_nick(&room, &orig.sender).await;
-            tracing::info!(%rid, %nick, bytes = body.len(), "inbound message");
-            let _ = bridge.from_matrix.send(FromMatrix::Message {
-                room: rid.to_owned(),
-                sender_nick: nick,
-                body,
-            });
-        }
-    });
+        });
+    }
 
     let send_client = client.clone();
     let send_bridge = bridge.clone();
