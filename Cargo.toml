@@ -23,6 +23,7 @@ rpassword = "7"
 
 [dev-dependencies]
 tempfile = "3"
+proptest = "1"
 
 [profile.release]
 lto = "thin"
