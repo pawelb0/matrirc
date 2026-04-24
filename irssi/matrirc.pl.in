@@ -3,7 +3,7 @@ use warnings;
 use Irssi;
 use IO::Socket::INET;
 
-our $VERSION = '0.2.0';
+our $VERSION = '0.2.1';
 our %IRSSI = (
     authors     => 'matrirc',
     name        => 'matrirc',
@@ -19,12 +19,17 @@ my $LOG       = "$STATE_DIR/log";
 my $PID_FILE  = "$STATE_DIR/daemon.pid";
 
 # How often we re-check daemon/connection state.
-my $POLL_MS     = 5000;
+my $POLL_MS       = 5000;
 # Minimum seconds between spawn attempts — guards against crash loops.
-my $SPAWN_GRACE = 5;
+my $SPAWN_GRACE   = 5;
+# Minimum seconds between connect attempts — guards against duplicate
+# servers (matrirc2, matrirc3, …) when registration is mid-handshake and
+# Irssi::servers() doesn't yet list it.
+my $CONNECT_GRACE = 15;
 
 my $poll_id;
-my $spawn_cooldown  = 0;
+my $spawn_cooldown   = 0;
+my $connect_cooldown = 0;
 my $last_state      = 'unknown';  # connected | starting | down | unknown
 my $unload_requested = 0;
 # Track whether this script spawned the current daemon, so we only stop it
@@ -46,6 +51,14 @@ sub daemon_alive {
 sub have_irc_connection {
     for my $s (Irssi::servers()) {
         return 1 if $s->{address} eq $HOST && $s->{port} == $PORT;
+    }
+    # Reconnecting/handshaking servers don't show up in servers() until
+    # registration completes; check the reconnection queue too so we don't
+    # fire a duplicate `connect matrirc` mid-handshake.
+    if (defined &Irssi::reconnects) {
+        for my $r (Irssi::reconnects()) {
+            return 1 if $r->{address} eq $HOST && $r->{port} == $PORT;
+        }
     }
     return 0;
 }
@@ -110,6 +123,9 @@ sub poll {
     }
 
     if ($alive && !$connected) {
+        my $now = time();
+        return if $connect_cooldown > $now;
+        $connect_cooldown = $now + $CONNECT_GRACE;
         set_state('starting', 'matrirc: daemon up, connecting');
         ensure_chatnet();
         Irssi::command("connect matrirc");
