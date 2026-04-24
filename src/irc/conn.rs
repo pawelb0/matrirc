@@ -243,8 +243,44 @@ async fn handle_join(
             joined.insert(chan.to_string());
             continue;
         }
+        if is_matrix_alias(chan) {
+            if let Err(e) = request_join_by_alias(write, nick, chan, bridge).await {
+                warn!(%chan, "join-by-alias dispatch: {e}");
+            }
+            continue;
+        }
         send(write, srv("403", vec![nick.into(), chan.into(), "No such channel".into()])).await?;
     }
+    Ok(())
+}
+
+fn is_matrix_alias(target: &str) -> bool {
+    target.starts_with('#') && target.contains(':')
+}
+
+async fn request_join_by_alias(
+    write: &mut OwnedWriteHalf,
+    nick: &str,
+    alias: &str,
+    bridge: &Bridge,
+) -> Result<()> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    bridge
+        .to_matrix
+        .try_send(ToMatrix::JoinByAlias { alias: alias.to_string(), reply: tx })
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    matrirc_notice(write, nick, &format!("joining {alias} ...")).await?;
+    tokio::spawn({
+        let nick = nick.to_string();
+        let alias = alias.to_string();
+        async move {
+            match rx.await {
+                Ok(Ok(chan)) => tracing::info!(%nick, %alias, %chan, "joined via alias"),
+                Ok(Err(e)) => tracing::warn!(%nick, %alias, "join failed: {e}"),
+                Err(_) => tracing::warn!(%nick, %alias, "join reply dropped"),
+            }
+        }
+    });
     Ok(())
 }
 
@@ -397,12 +433,40 @@ async fn handle_bot_command(
             for line in [
                 "matrirc — local Matrix↔IRC bridge",
                 "commands:",
-                "  help           this message",
-                "  rooms          list bridged Matrix channels",
-                "  dms            list known Matrix DMs",
-                "  version        matrirc version + crate info",
+                "  help                  this message",
+                "  rooms                 list bridged Matrix channels",
+                "  dms                   list known Matrix DMs",
+                "  search <term> [on <server>]   public-room directory",
+                "  version               matrirc version",
             ] {
                 matrirc_msg(write, nick, line).await?;
+            }
+        }
+        "search" => {
+            let rest = text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ");
+            let (query, server) = match rest.rsplit_once(" on ") {
+                Some((q, s)) => (q.trim().to_string(), Some(s.trim().to_string())),
+                None => (rest.trim().to_string(), None),
+            };
+            if query.is_empty() {
+                matrirc_msg(write, nick, "usage: search <term> [on <server>]").await?;
+                return Ok(());
+            }
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            if bridge.to_matrix.try_send(ToMatrix::SearchRooms { query, server, reply: tx }).is_err() {
+                matrirc_msg(write, nick, "search dispatch failed").await?;
+                return Ok(());
+            }
+            let rows = rx.await.unwrap_or_default();
+            if rows.is_empty() {
+                matrirc_msg(write, nick, "no matches").await?;
+            } else {
+                matrirc_msg(write, nick, &format!("{} result(s):", rows.len())).await?;
+                for r in rows.iter().take(15) {
+                    let alias = r.alias.as_deref().unwrap_or(&r.room_id);
+                    matrirc_msg(write, nick, &format!("  {alias}  ({} members) — {}", r.members, r.name)).await?;
+                }
+                matrirc_msg(write, nick, "join with: /join #alias:server.org").await?;
             }
         }
         "rooms" => {

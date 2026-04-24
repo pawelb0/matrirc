@@ -88,6 +88,15 @@ pub enum ToMatrix {
         room: OwnedRoomId,
         reply: oneshot::Sender<Vec<String>>,
     },
+    SearchRooms {
+        query: String,
+        server: Option<String>,
+        reply: oneshot::Sender<Vec<RoomListing>>,
+    },
+    JoinByAlias {
+        alias: String,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +104,14 @@ pub struct BackfillMessage {
     pub sender_nick: String,
     pub body: String,
     pub origin_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct RoomListing {
+    pub alias: Option<String>,
+    pub room_id: String,
+    pub name: String,
+    pub members: u64,
 }
 
 #[derive(Clone)]

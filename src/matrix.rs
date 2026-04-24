@@ -20,7 +20,7 @@ use serde::Deserialize;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::bridge::{mxid_localpart, BackfillMessage, Bridge, FromMatrix, ToMatrix};
+use crate::bridge::{mxid_localpart, BackfillMessage, Bridge, FromMatrix, RoomListing, ToMatrix};
 use crate::config::Config;
 use crate::names::{preferred_channel_name, NameStore};
 
@@ -181,16 +181,12 @@ async fn send_to_mxid(
     mxid: &matrix_sdk::ruma::UserId,
     body: &str,
 ) {
-    let room = match existing_dm_room(client, mxid).await {
-        Some(r) => r,
-        None => match client.create_dm(mxid).await {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("create_dm {mxid} failed: {e:#}");
-                notify_failure(bridge, mxid.as_str(), &format!("could not start DM: {e}"));
-                return;
-            }
-        },
+    let room = match find_or_create_dm(client, mxid).await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(%mxid, "DM open/create failed: {e:#}");
+            return;
+        }
     };
     let rid = room.room_id().to_owned();
     let nick = dm_peer_nick(client, &room)
@@ -200,25 +196,19 @@ async fn send_to_mxid(
     send_to_room(client, bridge, &rid, body).await;
 }
 
-async fn existing_dm_room(client: &Client, mxid: &matrix_sdk::ruma::UserId) -> Option<Room> {
+async fn find_or_create_dm(client: &Client, mxid: &matrix_sdk::ruma::UserId) -> Result<Room> {
     for room in client.rooms() {
         if !room.is_direct().await.unwrap_or(false) {
             continue;
         }
-        let members = room.members(RoomMemberships::JOIN | RoomMemberships::INVITE).await.ok()?;
+        let Ok(members) = room.members(RoomMemberships::JOIN | RoomMemberships::INVITE).await else {
+            continue;
+        };
         if members.iter().any(|m| m.user_id() == mxid) {
-            return Some(room);
+            return Ok(room);
         }
     }
-    None
-}
-
-fn notify_failure(bridge: &Bridge, dest: &str, reason: &str) {
-    let _ = bridge.from_matrix.send(FromMatrix::Message {
-        room: matrix_sdk::ruma::OwnedRoomId::try_from("!local:matrirc.local").unwrap(),
-        sender_nick: "matrirc".into(),
-        body: format!("[to {dest}] {reason}"),
-    });
+    client.create_dm(mxid).await.context("create_dm")
 }
 
 async fn send_to_room(
@@ -243,6 +233,74 @@ async fn send_to_room(
             });
         }
     }
+}
+
+async fn search_rooms(client: &Client, query: &str, server: Option<&str>) -> Vec<RoomListing> {
+    use matrix_sdk::ruma::api::client::directory::get_public_rooms_filtered;
+    use matrix_sdk::ruma::directory::Filter;
+
+    let mut req = get_public_rooms_filtered::v3::Request::new();
+    let mut filter = Filter::new();
+    if !query.is_empty() {
+        filter.generic_search_term = Some(query.to_string());
+    }
+    req.filter = filter;
+    req.limit = Some(20u32.into());
+    if let Some(s) = server {
+        if let Ok(name) = matrix_sdk::ruma::OwnedServerName::try_from(s) {
+            req.server = Some(name);
+        }
+    }
+
+    let resp = match client.public_rooms_filtered(req).await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("public_rooms_filtered failed: {e:#}");
+            return Vec::new();
+        }
+    };
+    resp.chunk
+        .into_iter()
+        .map(|c| RoomListing {
+            alias: c.canonical_alias.map(|a| a.to_string()),
+            room_id: c.room_id.to_string(),
+            name: c.name.unwrap_or_default(),
+            members: u64::from(c.num_joined_members),
+        })
+        .collect()
+}
+
+async fn join_by_alias(
+    client: &Client,
+    bridge: &Bridge,
+    name_store: &Arc<NameStore>,
+    alias: &str,
+) -> Result<String, String> {
+    use matrix_sdk::ruma::{OwnedServerName, RoomOrAliasId};
+
+    let parsed = <&RoomOrAliasId>::try_from(alias).map_err(|e| format!("bad alias: {e}"))?;
+    let via: Vec<OwnedServerName> = alias
+        .rsplit_once(':')
+        .and_then(|(_, server)| OwnedServerName::try_from(server).ok())
+        .into_iter()
+        .collect();
+    let room = client
+        .join_room_by_id_or_alias(parsed, &via)
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+
+    let name = room
+        .display_name()
+        .await
+        .map(|n| n.to_string())
+        .unwrap_or_else(|_| alias.to_string());
+    let preferred = preferred_channel_name(room.room_id(), Some(&name));
+    let chan = name_store
+        .assign_or_get(room.room_id(), &preferred)
+        .map_err(|e| format!("assign chan: {e}"))?;
+    let topic = room.topic().unwrap_or_else(|| name.clone());
+    bridge.add_mapping(room.room_id().to_owned(), chan.clone(), topic);
+    Ok(chan)
 }
 
 async fn fetch_members(client: &Client, room_id: &matrix_sdk::ruma::RoomId) -> Vec<String> {
@@ -620,6 +678,7 @@ pub async fn run_sync(
     let send_client = client.clone();
     let send_bridge = bridge.clone();
     let homeserver_for_sender = cfg.homeserver_url.clone();
+    let name_store_for_sender = name_store.clone();
     tokio::spawn(async move {
         while let Some(cmd) = to_matrix.recv().await {
             match cmd {
@@ -635,6 +694,14 @@ pub async fn run_sync(
                 }
                 ToMatrix::Members { room, reply } => {
                     let _ = reply.send(fetch_members(&send_client, &room).await);
+                }
+                ToMatrix::SearchRooms { query, server, reply } => {
+                    let _ = reply.send(search_rooms(&send_client, &query, server.as_deref()).await);
+                }
+                ToMatrix::JoinByAlias { alias, reply } => {
+                    let _ = reply.send(
+                        join_by_alias(&send_client, &send_bridge, &name_store_for_sender, &alias).await,
+                    );
                 }
             }
         }
