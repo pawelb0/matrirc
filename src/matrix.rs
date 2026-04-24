@@ -952,6 +952,17 @@ pub async fn whoami(http: &reqwest::Client, homeserver: &str, token: &str) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+    use matrix_sdk::ruma::events::room::message::{
+        EmoteMessageEventContent, ImageMessageEventContent, NoticeMessageEventContent,
+        TextMessageEventContent,
+    };
+    use matrix_sdk::ruma::OwnedMxcUri;
+
+    const HS: &str = "https://example.org";
+
+    fn content(m: MessageType) -> RoomMessageEventContent {
+        RoomMessageEventContent::new(m)
+    }
 
     #[test]
     fn parses_mxid() {
@@ -961,8 +972,65 @@ mod tests {
 
     #[test]
     fn rejects_bad_mxid() {
-        assert!(server_name_from_mxid("me:example.org").is_err());
-        assert!(server_name_from_mxid("@me").is_err());
-        assert!(server_name_from_mxid("@me:").is_err());
+        for bad in ["me:example.org", "@me", "@me:", "", "@"] {
+            assert!(server_name_from_mxid(bad).is_err(), "{bad:?} should fail");
+        }
     }
+
+    #[test]
+    fn body_text_and_notice_pass_through() {
+        let t = content(MessageType::Text(TextMessageEventContent::plain("hi")));
+        assert_eq!(body_from_event(&t, HS).as_deref(), Some("hi"));
+        let n = content(MessageType::Notice(NoticeMessageEventContent::plain("bye")));
+        assert_eq!(body_from_event(&n, HS).as_deref(), Some("bye"));
+    }
+
+    #[test]
+    fn body_emote_wraps_ctcp_action() {
+        let e = content(MessageType::Emote(EmoteMessageEventContent::plain("waves")));
+        assert_eq!(body_from_event(&e, HS).as_deref(), Some("\x01ACTION waves\x01"));
+    }
+
+    #[test]
+    fn body_image_resolves_mxc_to_https() {
+        let mxc = OwnedMxcUri::from("mxc://example.org/abc123");
+        let img = content(MessageType::Image(ImageMessageEventContent::plain("kitten.png".into(), mxc)));
+        let out = body_from_event(&img, HS).unwrap();
+        assert!(out.contains("[image]"), "{out}");
+        assert!(out.contains("kitten.png"), "{out}");
+        assert!(out.contains("https://example.org/_matrix/media/v3/download/example.org/abc123"), "{out}");
+    }
+
+    #[test]
+    fn strip_reply_fallback_noop_when_no_prefix() {
+        assert_eq!(strip_reply_fallback("plain text"), "plain text");
+    }
+
+    #[test]
+    fn strip_reply_fallback_drops_quoted_header() {
+        let src = "> <@a:h> first line\n> second line\n\nactual reply";
+        assert_eq!(strip_reply_fallback(src), "actual reply");
+    }
+
+    #[test]
+    fn mxc_to_https_valid_and_invalid() {
+        assert_eq!(
+            mxc_to_https("mxc://server.org/id42", "https://hs.example.org/"),
+            Some("https://hs.example.org/_matrix/media/v3/download/server.org/id42".into()),
+        );
+        assert_eq!(mxc_to_https("http://not-mxc/x", HS), None);
+        assert_eq!(mxc_to_https("mxc://no-slash", HS), None);
+    }
+
+    #[test]
+    fn sanitize_nick_edges() {
+        assert_eq!(sanitize_nick("Alice"), "Alice");
+        assert_eq!(sanitize_nick("Paweł"), "Pawe");
+        assert_eq!(sanitize_nick("hi there!"), "hi_there");
+        assert_eq!(sanitize_nick("123foo"), "_123foo");
+        assert_eq!(sanitize_nick("!!!"), "_");
+        assert_eq!(sanitize_nick(""), "_");
+        assert_eq!(sanitize_nick("a".repeat(40).as_str()).len(), 16);
+    }
+
 }

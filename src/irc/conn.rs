@@ -701,7 +701,7 @@ async fn handle_privmsg(
     }
     if target.eq_ignore_ascii_case("matrirc") {
         if emote { return Ok(()); }
-        return handle_bot_command(write, nick, &body, bridge).await;
+        return handle_bot_command(write, nick, body, bridge).await;
     }
 
     // IRCv3 echo-message: if the client negotiated it, the client suppresses
