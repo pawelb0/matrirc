@@ -3,7 +3,7 @@ pub mod proto;
 
 use anyhow::{Context, Result};
 use tokio::net::TcpListener;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use crate::bridge::Bridge;
 
@@ -14,7 +14,7 @@ pub async fn serve(addr: &str, bridge: Bridge) -> Result<()> {
     info!(%addr, "matrirc IRC listening");
     loop {
         let (sock, peer) = listener.accept().await.context("accept")?;
-        info!(%peer, "client connected");
+        debug!(%peer, "accept");
         let b = bridge.clone();
         tokio::spawn(async move {
             if let Err(e) = conn::handle(sock, peer, b).await {

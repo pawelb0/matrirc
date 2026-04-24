@@ -19,7 +19,8 @@ const ISO_FMT: &[FormatItem<'static>] = format_description!(
 );
 const SERVER_TIME_CAP: &str = "server-time";
 const MESSAGE_TAGS_CAP: &str = "message-tags";
-const SUPPORTED_CAPS: &[&str] = &[SERVER_TIME_CAP, MESSAGE_TAGS_CAP];
+const ECHO_MESSAGE_CAP: &str = "echo-message";
+const SUPPORTED_CAPS: &[&str] = &[SERVER_TIME_CAP, MESSAGE_TAGS_CAP, ECHO_MESSAGE_CAP];
 
 const SERVER_NAME: &str = "matrirc.local";
 const VERSION: &str = concat!("matrirc-", env!("CARGO_PKG_VERSION"));
@@ -42,6 +43,8 @@ struct State {
     registered: bool,
     joined: HashSet<String>,
     caps: HashSet<String>,
+    dm_backfilled: HashSet<matrix_sdk::ruma::OwnedRoomId>,
+    dm_hinted: HashSet<matrix_sdk::ruma::OwnedRoomId>,
 }
 
 pub async fn handle(sock: TcpStream, peer: SocketAddr, bridge: Bridge) -> Result<()> {
@@ -63,7 +66,8 @@ pub async fn handle(sock: TcpStream, peer: SocketAddr, bridge: Bridge) -> Result
                     if let (Some(n), Some(_)) = (s.nick.clone(), s.user.clone()) {
                         send_welcome(&mut write, &n).await?;
                         s.registered = true;
-                        auto_join_all(&mut write, &n, &bridge, &mut s.joined, &s.caps).await?;
+                        info!(%peer, nick = %n, "client registered");
+                        auto_join_all(&mut write, &n, &bridge, &mut s).await?;
                     }
                 }
             }
@@ -76,7 +80,11 @@ pub async fn handle(sock: TcpStream, peer: SocketAddr, bridge: Bridge) -> Result
             }
         }
     }
-    info!(%peer, "client disconnected");
+    if s.registered {
+        info!(%peer, "client disconnected");
+    } else {
+        debug!(%peer, "probe closed");
+    }
     Ok(())
 }
 
@@ -143,7 +151,7 @@ async fn handle_command(
             handle_part(write, &n, msg, &mut s.joined).await?;
         },
         "PRIVMSG" => if let Some(n) = s.nick.clone() {
-            handle_privmsg(write, &n, msg, bridge).await?;
+            handle_privmsg(write, &n, msg, bridge, s).await?;
         },
         "WHOIS" => if let Some(n) = s.nick.clone() {
             handle_whois(write, &n, msg, bridge).await?;
@@ -358,35 +366,49 @@ async fn auto_join_all(
     write: &mut OwnedWriteHalf,
     nick: &str,
     bridge: &Bridge,
-    joined: &mut HashSet<String>,
-    caps: &HashSet<String>,
+    s: &mut State,
 ) -> Result<()> {
-    let snapshot = bridge.snapshot();
-    let dm_count = bridge.dm_count();
-    if snapshot.is_empty() && dm_count == 0 {
+    let channels = bridge.snapshot();
+    let dms = bridge.dms();
+    if channels.is_empty() && dms.is_empty() {
         matrirc_notice(write, nick, "sync still in progress — channels will auto-join when ready").await?;
         return Ok(());
     }
-    info!(%nick, channels = snapshot.len(), dms = dm_count, "auto-join");
+    info!(%nick, channels = channels.len(), dms = dms.len(), "auto-join");
+
     let mut new_joins = Vec::new();
-    for (chan, room) in &snapshot {
-        if joined.contains(chan) { continue; }
+    for (chan, room) in &channels {
+        if s.joined.contains(chan) { continue; }
         let topic = bridge.topic_for(chan).unwrap_or_default();
         // Fast preamble with placeholder NAMES; proper member list comes with backfill.
         send_join(write, nick, chan, &topic, &["matrix"]).await?;
-        joined.insert(chan.clone());
+        s.joined.insert(chan.clone());
         new_joins.push((chan.clone(), room.clone()));
     }
-    let names: Vec<&str> = new_joins.iter().map(|(c, _)| c.as_str()).collect();
-    let joined_list = if names.is_empty() { "(none)".to_string() } else { names.join(", ") };
+
+    let chan_names: Vec<&str> = new_joins.iter().map(|(c, _)| c.as_str()).collect();
+    let chan_list = if chan_names.is_empty() { "(none)".to_string() } else { chan_names.join(", ") };
+    let dm_list = if dms.is_empty() {
+        "(none)".to_string()
+    } else {
+        dms.iter().map(|(_, n)| n.as_str()).collect::<Vec<_>>().join(", ")
+    };
     matrirc_notice(
         write,
         nick,
-        &format!("bridged {} channel(s) + {dm_count} DM(s). channels: {joined_list}", names.len()),
-    )
-    .await?;
+        &format!("channels: {chan_list}  |  DMs: {dm_list}"),
+    ).await?;
+
     for (chan, room) in new_joins {
-        backfill_channel(write, &chan, &room, bridge, caps).await?;
+        backfill_channel(write, &chan, &room, bridge, &s.caps).await?;
+    }
+    // Eager DM backfill: populates one query window per DM under the canonical
+    // peer nick. Otherwise irssi has nothing to display until first message.
+    for (room, dm_nick) in dms {
+        if s.dm_backfilled.insert(room.clone()) {
+            let _ = dm_nick; // peer nick lands in backfill's own prefixes
+            backfill_channel(write, nick, &room, bridge, &s.caps).await?;
+        }
     }
     Ok(())
 }
@@ -530,11 +552,23 @@ async fn backfill_channel(
         Err(_) => return Ok(()),
     };
     let server_time = caps.contains(SERVER_TIME_CAP);
+    // `chan` is either `#channel` or the user's own nick (DM case).
+    let is_dm = !chan.starts_with('#');
+    let peer_nick = if is_dm { bridge.dm_nick_for(room) } else { None };
+
     for m in msgs {
-        let prefix = format!("{}!{0}@matrix", m.sender_nick);
+        // For DM own-messages: ZNC-style replay → source=self, target=peer.
+        // irssi renders these as outgoing in the peer's query window even
+        // without echo-message cap.
+        let (prefix, target): (String, &str) = if is_dm && m.is_own {
+            let Some(ref peer) = peer_nick else { continue; };
+            (format!("{chan}!{chan}@matrirc.local"), peer.as_str())
+        } else {
+            (format!("{}!{0}@matrix", m.sender_nick), chan)
+        };
         for piece in m.body.split('\n') {
             if piece.is_empty() { continue; }
-            let mut out = Message::with_prefix(&prefix, "PRIVMSG", vec![chan.into(), piece.into()]);
+            let mut out = Message::with_prefix(&prefix, "PRIVMSG", vec![target.into(), piece.into()]);
             if server_time {
                 if let Some(iso) = ms_to_iso(m.origin_ms) {
                     out = out.with_tag("time", iso);
@@ -649,6 +683,7 @@ async fn handle_privmsg(
     nick: &str,
     msg: &Message,
     bridge: &Bridge,
+    s: &mut State,
 ) -> Result<()> {
     let Some(target) = msg.params.first() else { return Ok(()); };
     let Some(raw) = msg.params.get(1) else { return Ok(()); };
@@ -664,8 +699,28 @@ async fn handle_privmsg(
         return handle_bot_command(write, nick, &body, bridge).await;
     }
 
+    // IRCv3 echo-message: if the client negotiated it, the client suppresses
+    // local echo and waits for the server to bounce back. Do it.
+    if s.caps.contains(ECHO_MESSAGE_CAP) {
+        let source = format!("{nick}!{nick}@matrirc.local");
+        let wire_body = if emote { format!("\x01ACTION {body}\x01") } else { body.to_string() };
+        send(write, Message::with_prefix(&source, "PRIVMSG", vec![target.clone(), wire_body])).await?;
+    }
+
     let body = body.to_string();
-    let cmd = if let Some(room) = bridge.room_for(target).or_else(|| bridge.dm_room_for(target)) {
+    let cmd = if let Some(room) = bridge.room_for(target) {
+        ToMatrix::Send { room, body, emote }
+    } else if let Some(room) = bridge.dm_room_for(target) {
+        // Non-canonical alias? Hint the canonical nick so the user knows where
+        // replies will land (the canonical window was pre-opened on register).
+        if let Some(canon) = bridge.dm_nick_for(&room) {
+            if !target.eq_ignore_ascii_case(&canon) && s.dm_hinted.insert(room.clone()) {
+                matrirc_notice(
+                    write, nick,
+                    &format!("DM peer is '{canon}' — replies land in /query {canon}"),
+                ).await?;
+            }
+        }
         ToMatrix::Send { room, body, emote }
     } else if target.contains(':') {
         // irssi strips leading '@' in /query; accept both forms.

@@ -27,10 +27,14 @@ impl Mapping {
         self.chan_to_topic.insert(chan.to_string(), topic);
     }
 
-    pub fn insert_dm(&mut self, room: OwnedRoomId, nick: impl Into<String>) {
+    pub fn insert_dm(&mut self, room: OwnedRoomId, nick: impl Into<String>, aliases: &[&str]) {
         let nick = nick.into();
-        let key = nick.to_ascii_lowercase();
-        self.nick_to_dm_room.insert(key, room.clone());
+        self.nick_to_dm_room.insert(nick.to_ascii_lowercase(), room.clone());
+        for a in aliases {
+            if !a.is_empty() {
+                self.nick_to_dm_room.insert(a.to_ascii_lowercase(), room.clone());
+            }
+        }
         self.dm_room_to_nick.insert(room, nick);
     }
 }
@@ -110,6 +114,9 @@ pub struct BackfillMessage {
     pub sender_nick: String,
     pub body: String,
     pub origin_ms: i64,
+    /// True when sender is the logged-in user. DM backfill drops these
+    /// because IRC can't emit "self→peer" without echo-message.
+    pub is_own: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -171,9 +178,11 @@ impl Bridge {
         self.mapping.read().unwrap().chan_to_topic.get(chan).cloned()
     }
 
-    pub fn add_dm(&self, room: OwnedRoomId, nick: String) {
+    /// Register a DM. `aliases` are extra lookup keys — typically the peer's
+    /// MXID localpart and full MXID so `/msg <any-form>` hits the same room.
+    pub fn add_dm(&self, room: OwnedRoomId, nick: String, aliases: &[&str]) {
         let mut m = self.mapping.write().unwrap();
-        m.insert_dm(room, nick.clone());
+        m.insert_dm(room, nick.clone(), aliases);
         drop(m);
         let _ = self.from_matrix.send(FromMatrix::DmAdded { nick });
     }
@@ -186,13 +195,11 @@ impl Bridge {
         self.mapping.read().unwrap().dm_room_to_nick.get(room).cloned()
     }
 
-    pub fn dm_room_for(&self, nick: &str) -> Option<OwnedRoomId> {
-        self.mapping
-            .read()
-            .unwrap()
-            .nick_to_dm_room
-            .get(&nick.to_ascii_lowercase())
-            .cloned()
+    pub fn dm_room_for(&self, target: &str) -> Option<OwnedRoomId> {
+        let m = self.mapping.read().unwrap();
+        m.nick_to_dm_room.get(&target.to_ascii_lowercase()).cloned()
+            // bare `kkrolikowski:server` form (irssi /query strips leading '@')
+            .or_else(|| m.nick_to_dm_room.get(&format!("@{target}").to_ascii_lowercase()).cloned())
     }
 
     pub fn room_for(&self, chan: &str) -> Option<OwnedRoomId> {
@@ -224,6 +231,18 @@ impl Bridge {
         let mut v: Vec<String> = m.dm_room_to_nick.values().cloned().collect();
         v.sort();
         v
+    }
+
+    /// Snapshot of `(room_id, canonical_nick)` — lets the IRC side drive DM
+    /// backfill on client connect.
+    pub fn dms(&self) -> Vec<(OwnedRoomId, String)> {
+        self.mapping
+            .read()
+            .unwrap()
+            .dm_room_to_nick
+            .iter()
+            .map(|(r, n)| (r.clone(), n.clone()))
+            .collect()
     }
 
     pub fn note_sent_by_us(&self, id: OwnedEventId) {

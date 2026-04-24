@@ -215,11 +215,11 @@ async fn send_to_mxid(
     let nick = dm_peer_nick(client, &room)
         .await
         .unwrap_or_else(|| mxid_localpart(mxid.as_str()).to_string());
-    // Tell the user which nick replies will arrive under (irssi opens a query
-    // under the original typed target, which is the MXID; replies come from
-    // `nick` which is a different window).
+    // Hint the canonical nick since the user's query window is currently
+    // labelled with the MXID form they typed.
     let _ = bridge.from_matrix.send(FromMatrix::DmAdded { nick: nick.clone() });
-    bridge.add_dm(rid.clone(), nick);
+    let localpart = mxid_localpart(mxid.as_str()).to_string();
+    bridge.add_dm(rid.clone(), nick, &[mxid.as_str(), &localpart]);
     send_to_room(client, bridge, &rid, body, emote).await;
 }
 
@@ -386,11 +386,12 @@ async fn fetch_members(client: &Client, room_id: &matrix_sdk::ruma::RoomId) -> V
 }
 
 async fn register_dm(client: &Client, bridge: &Bridge, room: &Room) {
-    let Some(nick) = dm_peer_nick(client, room).await else {
+    let Some((nick, mxid)) = dm_peer(client, room).await else {
         warn!(room = %room.room_id(), "DM has no identifiable peer");
         return;
     };
-    bridge.add_dm(room.room_id().to_owned(), nick);
+    let localpart = mxid_localpart(mxid.as_str()).to_string();
+    bridge.add_dm(room.room_id().to_owned(), nick, &[mxid.as_str(), &localpart]);
     // DMs skip backfill, so pull any server-side megolm keys in the background.
     if matches!(room.encryption_state(), EncryptionState::Encrypted) {
         let c = client.clone();
@@ -404,17 +405,19 @@ async fn register_dm(client: &Client, bridge: &Bridge, room: &Room) {
 }
 
 async fn dm_peer_nick(client: &Client, room: &Room) -> Option<String> {
+    dm_peer(client, room).await.map(|(nick, _)| nick)
+}
+
+/// Returns `(canonical_nick, mxid)` for the non-self member of a DM room.
+/// Canonical nick matches `sender_nick()` so inbound and outbound align.
+async fn dm_peer(client: &Client, room: &Room) -> Option<(String, matrix_sdk::ruma::OwnedUserId)> {
     let me = client.user_id()?;
-    let members = room
-        .members(RoomMemberships::JOIN | RoomMemberships::INVITE)
-        .await
-        .ok()?;
-    // Must match sender_nick()'s output: display name (sanitized) first, MXID
-    // localpart fallback. Otherwise /msg <nick> won't route to the same room
-    // that inbound messages appear from.
-    members.into_iter().find(|m| m.user_id() != me).map(|m| match m.display_name() {
-        Some(d) => sanitize_nick(d),
-        None => mxid_localpart(m.user_id().as_str()).to_string(),
+    let members = room.members(RoomMemberships::JOIN | RoomMemberships::INVITE).await.ok()?;
+    members.into_iter().find(|m| m.user_id() != me).map(|m| {
+        let nick = m.display_name()
+            .map(sanitize_nick)
+            .unwrap_or_else(|| mxid_localpart(m.user_id().as_str()).to_string());
+        (nick, m.user_id().to_owned())
     })
 }
 
@@ -474,6 +477,7 @@ async fn backfill(
                     sender_nick: sender_nick(&room, &orig.sender).await,
                     body,
                     origin_ms: orig.origin_server_ts.0.into(),
+                    is_own: Some(orig.sender.as_ref()) == client.user_id(),
                 });
             }
             AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomEncrypted(
@@ -483,6 +487,7 @@ async fn backfill(
                     sender_nick: sender_nick(&room, &orig.sender).await,
                     body: format!("{C_RED}[encrypted — run `matrirc bootstrap-e2ee` to decrypt]{C_RESET}"),
                     origin_ms: orig.origin_server_ts.0.into(),
+                    is_own: Some(orig.sender.as_ref()) == client.user_id(),
                 });
             }
             AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::Reaction(
@@ -492,6 +497,7 @@ async fn backfill(
                     sender_nick: sender_nick(&room, &orig.sender).await,
                     body: format!("\x01ACTION reacted {}\x01", orig.content.relates_to.key),
                     origin_ms: orig.origin_server_ts.0.into(),
+                    is_own: Some(orig.sender.as_ref()) == client.user_id(),
                 });
             }
             _ => continue,
