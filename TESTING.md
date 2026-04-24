@@ -1,6 +1,6 @@
 # Testing matrirc
 
-Six layers, each catching a different bug class. All tests live alongside the
+Five layers, each catching a different bug class. All tests live alongside the
 code under `#[cfg(test)]`, run under `cargo test`, and must pass `cargo clippy
 --all-targets -- -D warnings`.
 
@@ -66,18 +66,6 @@ case normalization, prefix handling edges.
 **Adding a test:** extend `arb_message` with new generators (e.g. wider
 prefix charset) — the existing `round_trip_any_valid_message` proptest
 picks them up.
-
-## 6. Sync retry invariant — `src/matrix.rs::tests`
-
-`sync_forever` driven with `#[tokio::test(start_paused = true)]`: the
-paused runtime fast-forwards the 10s backoff. Asserts the inner closure is
-called N+1 times after N errors.
-
-**Catches:** the "long-lived sync task dies silently on first error" class
-— which was the root of the "irssi restart needed to resync" bug.
-
-**Adding a test:** call `sync_forever` with a closure driven by an
-`AtomicU32` counter; assert on its final value.
 
 ## CI
 

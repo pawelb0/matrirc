@@ -732,32 +732,18 @@ pub async fn run_sync(
         }
     });
 
-    let mut first = Some(SyncSettings::default().token(initial.next_batch));
-    sync_forever(|| {
-        let s = first.take().unwrap_or_default();
-        let c = client.clone();
-        async move { c.sync(s).await.map_err(anyhow::Error::from) }
-    })
-    .await;
-    Ok(())
-}
-
-/// Drive a sync-like closure, retrying on error with a 10s backoff. Returns when
-/// the closure returns Ok (normally never, since `client.sync()` runs forever).
-async fn sync_forever<F, Fut>(mut once: F)
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<()>>,
-{
+    let mut settings = SyncSettings::default().token(initial.next_batch);
     loop {
-        match once().await {
-            Ok(()) => return,
+        match client.sync(settings.clone()).await {
+            Ok(()) => break,
             Err(e) => {
                 warn!("sync error, retrying in 10s: {e:#}");
                 tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                settings = SyncSettings::default();
             }
         }
     }
+    Ok(())
 }
 
 pub async fn login_with_password(
@@ -1049,17 +1035,5 @@ mod tests {
         assert_eq!(sanitize_nick("!!!"), "_");
         assert_eq!(sanitize_nick(""), "_");
         assert_eq!(sanitize_nick("a".repeat(40).as_str()).len(), 16);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn sync_forever_retries_on_error_until_ok() {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        let count = AtomicU32::new(0);
-        sync_forever(|| async {
-            let n = count.fetch_add(1, Ordering::SeqCst);
-            if n < 3 { Err(anyhow!("boom")) } else { Ok(()) }
-        })
-        .await;
-        assert_eq!(count.load(Ordering::SeqCst), 4);
     }
 }

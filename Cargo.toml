@@ -24,7 +24,6 @@ rpassword = "7"
 [dev-dependencies]
 tempfile = "3"
 proptest = "1"
-tokio = { version = "1", features = ["test-util"] }
 
 [profile.release]
 lto = "thin"
