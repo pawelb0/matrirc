@@ -312,4 +312,75 @@ mod tests {
         }
         assert_eq!(b.chan_for(&r), Some("#test-abc".into()));
     }
+
+    #[test]
+    fn insert_dm_resolves_every_alias() {
+        let mut m = Mapping::default();
+        let r = RoomId::parse("!xyz:server.org").unwrap();
+        m.insert_dm(r.clone(), "Phobos", &["@kkrolikowski:server.org", "kkrolikowski"]);
+        for key in ["phobos", "Phobos", "PHOBOS", "kkrolikowski", "KKrolikowski", "@kkrolikowski:server.org"] {
+            let hit = m.nick_to_dm_room.get(&key.to_ascii_lowercase());
+            assert_eq!(hit, Some(&r), "alias {key:?} should resolve");
+        }
+    }
+
+    #[test]
+    fn dm_room_for_accepts_bare_mxid() {
+        let (b, _rx) = Bridge::new(Mapping::default());
+        let r = RoomId::parse("!xyz:server.org").unwrap();
+        {
+            let mut m = b.mapping.write().unwrap();
+            m.insert_dm(r.clone(), "phobos", &["@kkrolikowski:server.org"]);
+        }
+        assert_eq!(b.dm_room_for("@kkrolikowski:server.org"), Some(r.clone()));
+        // irssi strips leading '@' when /query — accept bare form too
+        assert_eq!(b.dm_room_for("kkrolikowski:server.org"), Some(r));
+    }
+
+    #[test]
+    fn update_topic_broadcasts_and_is_noop_for_unknown() {
+        let (b, _rx) = Bridge::new(Mapping::default());
+        let mut sub = b.from_matrix.subscribe();
+        let r = RoomId::parse("!abc:server.org").unwrap();
+        b.add_mapping(r.clone(), "#c".into(), "old".into());
+        // drain RoomAdded
+        let _ = sub.try_recv();
+        b.update_topic(&r, "new topic".into());
+        match sub.try_recv().unwrap() {
+            FromMatrix::TopicChanged { chan, topic } => {
+                assert_eq!(chan, "#c");
+                assert_eq!(topic, "new topic");
+            }
+            _ => panic!("wrong event"),
+        }
+        assert_eq!(b.topic_for("#c").as_deref(), Some("new topic"));
+
+        // Unknown room → no event, no state change
+        let r2 = RoomId::parse("!never:server.org").unwrap();
+        b.update_topic(&r2, "ignored".into());
+        assert!(sub.try_recv().is_err());
+    }
+
+    #[test]
+    fn take_if_sent_by_us_removes_matched_event() {
+        let (b, _rx) = Bridge::new(Mapping::default());
+        let id = matrix_sdk::ruma::OwnedEventId::try_from("$one:h").unwrap();
+        b.note_sent_by_us(id.clone());
+        assert!(b.take_if_sent_by_us(&id));
+        assert!(!b.take_if_sent_by_us(&id), "second call should be false (consumed)");
+    }
+
+    #[test]
+    fn recent_sent_is_capped() {
+        let (b, _rx) = Bridge::new(Mapping::default());
+        // Overflow by more than the cap; oldest must be evicted.
+        for i in 0..(RECENT_SENT_CAP + 10) {
+            let id = matrix_sdk::ruma::OwnedEventId::try_from(format!("$e{i}:h").as_str()).unwrap();
+            b.note_sent_by_us(id);
+        }
+        let first = matrix_sdk::ruma::OwnedEventId::try_from("$e0:h").unwrap();
+        assert!(!b.take_if_sent_by_us(&first), "oldest should have been evicted");
+        let recent = matrix_sdk::ruma::OwnedEventId::try_from(format!("$e{}:h", RECENT_SENT_CAP + 9).as_str()).unwrap();
+        assert!(b.take_if_sent_by_us(&recent));
+    }
 }
