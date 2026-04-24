@@ -29,44 +29,34 @@ pub enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Log in to a Matrix homeserver. By default prompts for your password
-    /// (m.login.password) and then walks you through SAS emoji verification
-    /// from another device to enable E2EE rooms. Pass --token to use an
-    /// existing access token instead (read from MATRIRC_TOKEN or stdin);
-    /// --skip-verify to delay E2EE setup until `matrirc bootstrap-e2ee`.
+    /// Log in: password + SAS emoji verify. `--token` for access-token mode.
     Login {
         /// Your Matrix user ID, e.g. @you:matrix.org
         mxid: String,
-        /// Override the homeserver URL instead of resolving via .well-known.
+        /// Override homeserver URL (skip .well-known resolution).
         #[arg(long)]
         homeserver: Option<String>,
-        /// Use an access token instead of password login.
+        /// Read access token from MATRIRC_TOKEN / stdin instead of password prompt.
         #[arg(long)]
         token: bool,
         /// Skip SAS device verification after login.
         #[arg(long)]
         skip_verify: bool,
     },
-    /// One-shot import of cross-signing + message backup key using a Secure Secret
-    /// Storage recovery key. Required once per fresh crypto store so E2EE rooms decrypt.
-    /// Key is read from MATRIRC_RECOVERY_KEY env var, or piped on stdin. The key is
-    /// not persisted by matrirc anywhere.
+    /// Import cross-signing + backup key via SSS recovery key (from
+    /// MATRIRC_RECOVERY_KEY or stdin). Not persisted.
     BootstrapE2ee,
-    /// Wipe local matrirc state (config, crypto store, name store) so the next
-    /// login creates a fresh device. Does NOT sign the device out on the
-    /// homeserver — do that in Element → Settings → Sessions.
+    /// Wipe local state (config, crypto store, names). Does not sign out the
+    /// device on the homeserver — do that in Element → Sessions.
     Reset {
-        /// Skip the confirmation prompt.
         #[arg(long)]
         force: bool,
     },
-    /// Re-run SAS emoji verification against another device. Use this if
-    /// the `matrirc login` SAS prompt timed out or your peer device was
-    /// offline at that moment.
+    /// Re-run SAS emoji verification against another device.
     Verify,
-    /// Report whether a matrirc daemon is currently running.
+    /// Report whether the daemon is running.
     Status,
-    /// Stop the running daemon (SIGTERM).
+    /// SIGTERM the running daemon.
     Stop,
 }
 
