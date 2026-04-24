@@ -601,10 +601,15 @@ pub async fn run_sync(
     env_override_room: Option<matrix_sdk::ruma::OwnedRoomId>,
 ) -> Result<()> {
     let client = build_client_restored(&cfg).await?;
-    let initial = client
-        .sync_once(SyncSettings::default())
-        .await
-        .context("initial sync")?;
+    let initial = loop {
+        match client.sync_once(SyncSettings::default()).await {
+            Ok(r) => break r,
+            Err(e) => {
+                warn!("initial sync failed, retrying in 10s: {e:#}");
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            }
+        }
+    };
 
     for room in client.rooms() {
         let name = room.display_name().await.map(|n| n.to_string()).unwrap_or_else(|_| "<no name>".into());
