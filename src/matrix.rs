@@ -20,7 +20,9 @@ use serde::Deserialize;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::bridge::{mxid_localpart, BackfillMessage, Bridge, FromMatrix, RoomListing, ToMatrix};
+use crate::bridge::{
+    mxid_localpart, BackfillMessage, Bridge, FromMatrix, RoomListing, ToMatrix, WhoisInfo,
+};
 use crate::config::Config;
 use crate::names::{preferred_channel_name, NameStore};
 
@@ -301,6 +303,41 @@ async fn join_by_alias(
     let topic = room.topic().unwrap_or_else(|| name.clone());
     bridge.add_mapping(room.room_id().to_owned(), chan.clone(), topic);
     Ok(chan)
+}
+
+async fn whois_lookup(client: &Client, nick: &str) -> Option<WhoisInfo> {
+    let needle = nick.to_ascii_lowercase();
+    let me = client.user_id()?;
+    let mut match_mxid: Option<matrix_sdk::ruma::OwnedUserId> = None;
+    let mut match_display: Option<String> = None;
+    let mut rooms = Vec::new();
+    for room in client.rooms() {
+        let Ok(members) = room.members(RoomMemberships::JOIN).await else { continue };
+        for m in members {
+            if m.user_id() == me { continue; }
+            let display = m.display_name().map(|d| sanitize_nick(d));
+            let local = mxid_localpart(m.user_id().as_str()).to_string();
+            let hits = display.as_deref() == Some(nick)
+                || display.as_deref().map(str::to_ascii_lowercase).as_deref() == Some(&needle)
+                || local == nick
+                || local.to_ascii_lowercase() == needle;
+            if !hits { continue; }
+            if match_mxid.is_none() {
+                match_mxid = Some(m.user_id().to_owned());
+                match_display = m.display_name().map(ToOwned::to_owned);
+            }
+            if match_mxid.as_deref() == Some(m.user_id()) {
+                let name = room.display_name().await.map(|n| n.to_string()).unwrap_or_default();
+                rooms.push(if name.is_empty() { room.room_id().to_string() } else { name });
+            }
+        }
+    }
+    match_mxid.map(|mxid| WhoisInfo {
+        nick: nick.to_string(),
+        mxid: mxid.to_string(),
+        display_name: match_display,
+        rooms,
+    })
 }
 
 async fn fetch_members(client: &Client, room_id: &matrix_sdk::ruma::RoomId) -> Vec<String> {
@@ -702,6 +739,9 @@ pub async fn run_sync(
                     let _ = reply.send(
                         join_by_alias(&send_client, &send_bridge, &name_store_for_sender, &alias).await,
                     );
+                }
+                ToMatrix::Whois { nick, reply } => {
+                    let _ = reply.send(whois_lookup(&send_client, &nick).await);
                 }
             }
         }

@@ -162,6 +162,11 @@ async fn handle_command(
                 handle_privmsg(write, n, msg, bridge).await?;
             }
         }
+        "WHOIS" => {
+            if let Some(n) = nick.as_deref() {
+                handle_whois(write, n, msg, bridge).await?;
+            }
+        }
         "NOTICE" => debug!(?msg, "client NOTICE ignored"),
         "QUIT" => {
             let _ = write.shutdown().await;
@@ -566,6 +571,80 @@ fn ms_to_iso(ms: i64) -> Option<String> {
         .ok()?
         .format(ISO_FMT)
         .ok()
+}
+
+async fn handle_whois(
+    write: &mut OwnedWriteHalf,
+    nick: &str,
+    msg: &Message,
+    bridge: &Bridge,
+) -> Result<()> {
+    // WHOIS [<server>] <nick> — SKIP the optional server hint.
+    let target = msg.params.iter().rfind(|p| !p.is_empty()).cloned();
+    let Some(target) = target else { return Ok(()); };
+
+    // Local pseudo-users.
+    match target.as_str() {
+        ECHO_NICK => {
+            send_whois(write, nick, ECHO_NICK, "echo", "matrirc.local", "Echo bot", Some("matrirc.local"), &[ECHO_CHAN.to_string()]).await?;
+            return Ok(());
+        }
+        "matrirc" => {
+            send_whois(write, nick, "matrirc", "matrirc", "matrirc.local", "matrirc bridge control", Some("matrirc.local"), &[]).await?;
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if bridge.to_matrix.try_send(ToMatrix::Whois { nick: target.clone(), reply: tx }).is_err() {
+        send(write, srv("401", vec![nick.into(), target.clone(), "No such nick/channel".into()])).await?;
+        send(write, srv("318", vec![nick.into(), target, "End of /WHOIS list".into()])).await?;
+        return Ok(());
+    }
+    match rx.await.ok().flatten() {
+        Some(info) => {
+            let realname = info.display_name.as_deref().unwrap_or(&info.mxid);
+            let server_hint = info.mxid.rsplit_once(':').map(|(_, s)| s);
+            send_whois(
+                write,
+                nick,
+                &info.nick,
+                &info.nick,
+                "matrix",
+                realname,
+                server_hint,
+                &info.rooms,
+            ).await?;
+        }
+        None => {
+            send(write, srv("401", vec![nick.into(), target.clone(), "No such nick/channel".into()])).await?;
+            send(write, srv("318", vec![nick.into(), target, "End of /WHOIS list".into()])).await?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_whois(
+    write: &mut OwnedWriteHalf,
+    nick: &str,
+    target_nick: &str,
+    user: &str,
+    host: &str,
+    realname: &str,
+    server: Option<&str>,
+    channels: &[String],
+) -> Result<()> {
+    send(write, srv("311", vec![nick.into(), target_nick.into(), user.into(), host.into(), "*".into(), realname.into()])).await?;
+    if let Some(s) = server {
+        send(write, srv("312", vec![nick.into(), target_nick.into(), s.into(), "Matrix homeserver".into()])).await?;
+    }
+    if !channels.is_empty() {
+        send(write, srv("319", vec![nick.into(), target_nick.into(), channels.join(" ")])).await?;
+    }
+    send(write, srv("318", vec![nick.into(), target_nick.into(), "End of /WHOIS list".into()])).await?;
+    Ok(())
 }
 
 async fn handle_part(

@@ -97,6 +97,10 @@ pub enum ToMatrix {
         alias: String,
         reply: oneshot::Sender<Result<String, String>>,
     },
+    Whois {
+        nick: String,
+        reply: oneshot::Sender<Option<WhoisInfo>>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -112,6 +116,14 @@ pub struct RoomListing {
     pub room_id: String,
     pub name: String,
     pub members: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct WhoisInfo {
+    pub nick: String,
+    pub mxid: String,
+    pub display_name: Option<String>,
+    pub rooms: Vec<String>,
 }
 
 #[derive(Clone)]
