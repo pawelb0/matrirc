@@ -75,23 +75,26 @@ const C_RED: &str = "\x0305";
 const C_SILVER: &str = "\x0315";
 const C_RESET: &str = "\x0f";
 
-/// Returns the sender nick if the event should be forwarded, `None` to drop.
+/// Returns `(sender_nick, is_own)` if the event should be forwarded, `None` to drop.
 async fn accept_event(
     bridge: &Bridge,
     room: &Room,
     event_id: &matrix_sdk::ruma::EventId,
     sender: &matrix_sdk::ruma::UserId,
-) -> Option<String> {
+    own: &matrix_sdk::ruma::UserId,
+) -> Option<(String, bool)> {
     if !bridge.has_room(room.room_id()) { return None; }
     if bridge.take_if_sent_by_us(event_id) { return None; }
-    Some(sender_nick(room, sender).await)
+    let nick = sender_nick(room, sender).await;
+    Some((nick, sender == own))
 }
 
-fn emit_message(bridge: &Bridge, room: &matrix_sdk::ruma::RoomId, nick: String, body: String) {
+fn emit_message(bridge: &Bridge, room: &matrix_sdk::ruma::RoomId, nick: String, body: String, is_own: bool) {
     let _ = bridge.from_matrix.send(FromMatrix::Message {
         room: room.to_owned(),
         sender_nick: nick,
         body,
+        is_own,
     });
 }
 
@@ -262,6 +265,7 @@ async fn send_to_room(
                 room: room_id.to_owned(),
                 sender_nick: "matrirc".into(),
                 body: format!("[send failed: {e}]"),
+                is_own: false,
             });
         }
     }
@@ -638,15 +642,19 @@ pub async fn run_sync(
         });
     }
 
+    let own_id = client.user_id().ok_or_else(|| anyhow!("client has no user_id"))?.to_owned();
+
     {
         let bridge = bridge.clone();
+        let own = own_id.clone();
         client.add_event_handler(move |ev: SyncReactionEvent, room: Room| {
             let bridge = bridge.clone();
+            let own = own.clone();
             async move {
                 let Some(orig) = ev.as_original() else { return; };
-                let Some(nick) = accept_event(&bridge, &room, &orig.event_id, &orig.sender).await else { return; };
+                let Some((nick, is_own)) = accept_event(&bridge, &room, &orig.event_id, &orig.sender, &own).await else { return; };
                 emit_message(&bridge, room.room_id(), nick,
-                    format!("\x01ACTION reacted {}\x01", orig.content.relates_to.key));
+                    format!("\x01ACTION reacted {}\x01", orig.content.relates_to.key), is_own);
             }
         });
     }
@@ -654,13 +662,15 @@ pub async fn run_sync(
     // UTD path: SDK couldn't decrypt; surface a placeholder so the user sees activity.
     {
         let bridge = bridge.clone();
+        let own = own_id.clone();
         client.add_event_handler(move |ev: SyncRoomEncryptedEvent, room: Room| {
             let bridge = bridge.clone();
+            let own = own.clone();
             async move {
                 let Some(orig) = ev.as_original() else { return; };
-                let Some(nick) = accept_event(&bridge, &room, &orig.event_id, &orig.sender).await else { return; };
+                let Some((nick, is_own)) = accept_event(&bridge, &room, &orig.event_id, &orig.sender, &own).await else { return; };
                 emit_message(&bridge, room.room_id(), nick,
-                    format!("{C_RED}[encrypted — run `matrirc bootstrap-e2ee` once to decrypt]{C_RESET}"));
+                    format!("{C_RED}[encrypted — run `matrirc bootstrap-e2ee` once to decrypt]{C_RESET}"), is_own);
             }
         });
     }
@@ -668,14 +678,16 @@ pub async fn run_sync(
     {
         let bridge = bridge.clone();
         let homeserver = cfg.homeserver_url.clone();
+        let own = own_id;
         client.add_event_handler(move |ev: SyncRoomMessageEvent, room: Room| {
             let bridge = bridge.clone();
             let homeserver = homeserver.clone();
+            let own = own.clone();
             async move {
                 let Some(orig) = ev.as_original() else { return; };
-                let Some(nick) = accept_event(&bridge, &room, &orig.event_id, &orig.sender).await else { return; };
+                let Some((nick, is_own)) = accept_event(&bridge, &room, &orig.event_id, &orig.sender, &own).await else { return; };
                 let Some(body) = body_from_event(&orig.content, &homeserver) else { return; };
-                emit_message(&bridge, room.room_id(), nick, body);
+                emit_message(&bridge, room.room_id(), nick, body, is_own);
             }
         });
     }

@@ -88,6 +88,14 @@ sub set_state {
     $last_state = $new;
 }
 
+sub ensure_chatnet {
+    for my $n (Irssi::chatnets()) {
+        return if $n->{name} eq 'matrirc';
+    }
+    Irssi::command("network add matrirc");
+    Irssi::command("server add -network matrirc $HOST $PORT");
+}
+
 sub poll {
     return if $unload_requested;
 
@@ -103,7 +111,8 @@ sub poll {
 
     if ($alive && !$connected) {
         set_state('starting', 'matrirc: daemon up, connecting');
-        Irssi::command("connect $HOST $PORT");
+        ensure_chatnet();
+        Irssi::command("connect matrirc");
         return;
     }
 

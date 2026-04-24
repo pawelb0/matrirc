@@ -58,6 +58,9 @@ pub enum FromMatrix {
         room: OwnedRoomId,
         sender_nick: String,
         body: String,
+        /// True when the sender is the logged-in user (message originated on
+        /// another device). Lets IRC conn route as `self→peer` for DMs.
+        is_own: bool,
     },
     RoomAdded {
         room: OwnedRoomId,

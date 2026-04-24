@@ -95,15 +95,20 @@ async fn handle_matrix_event(
     ev: FromMatrix,
 ) -> Result<()> {
     match ev {
-        FromMatrix::Message { room, sender_nick, body } => {
-            let target = if let Some(chan) = bridge.chan_for(&room) {
+        FromMatrix::Message { room, sender_nick, body, is_own } => {
+            let (prefix, target) = if let Some(chan) = bridge.chan_for(&room) {
                 if !s.joined.contains(&chan) { return Ok(()); }
-                chan
-            } else if bridge.dm_nick_for(&room).is_some() {
-                // DM: deliver to the client's own nick so irssi opens a query window
-                match s.nick.as_deref() { Some(n) => n.to_string(), None => return Ok(()) }
+                (format!("{sender_nick}!{sender_nick}@matrix"), chan)
+            } else if let Some(peer) = bridge.dm_nick_for(&room) {
+                let Some(n) = s.nick.as_deref() else { return Ok(()); };
+                if is_own {
+                    // Own message from another device: ZNC-style self→peer so it
+                    // renders in the peer's query window, not a self-query.
+                    (format!("{n}!{n}@matrirc.local"), peer)
+                } else {
+                    (format!("{sender_nick}!{sender_nick}@matrix"), n.to_string())
+                }
             } else { return Ok(()); };
-            let prefix = format!("{sender_nick}!{sender_nick}@matrix");
             for piece in body.split('\n').filter(|p| !p.is_empty()) {
                 send(write, Message::with_prefix(&prefix, "PRIVMSG", vec![target.clone(), piece.into()])).await?;
             }
