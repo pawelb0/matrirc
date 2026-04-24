@@ -28,6 +28,10 @@ pub enum Command {
         /// Print the rendered script to stdout instead of writing it.
         #[arg(long)]
         dry_run: bool,
+        /// Embed this absolute path in the script instead of PATH lookup.
+        /// Useful for dev builds (`target/debug/matrirc`) that aren't on PATH.
+        #[arg(long)]
+        bin: Option<PathBuf>,
     },
     /// Log in: password + SAS emoji verify. `--token` for access-token mode.
     Login {
@@ -246,9 +250,17 @@ pub fn reset(force: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn install_irssi(force: bool, dry_run: bool) -> Result<()> {
-    let bin = std::env::current_exe().context("current_exe")?;
-    let script = render(&bin)?;
+pub fn install_irssi(force: bool, dry_run: bool, bin: Option<PathBuf>) -> Result<()> {
+    let bin_str: String = match bin {
+        Some(p) => p
+            .to_str()
+            .ok_or_else(|| anyhow!("binary path is not valid UTF-8: {}", p.display()))?
+            .to_string(),
+        // Plain command name → let the user's $PATH resolve it at runtime.
+        // Survives matrirc being reinstalled, brew upgrades, etc.
+        None => "matrirc".to_string(),
+    };
+    let script = render_from_str(&bin_str)?;
 
     if dry_run {
         print!("{script}");
@@ -290,16 +302,11 @@ pub fn install_irssi(force: bool, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
-fn render(bin: &std::path::Path) -> Result<String> {
-    let bin_str = bin
-        .to_str()
-        .ok_or_else(|| anyhow!("binary path is not valid UTF-8: {}", bin.display()))?;
-    if bin_str.contains('\'') {
-        return Err(anyhow!(
-            "binary path contains a single quote, refusing to embed: {bin_str}"
-        ));
+fn render_from_str(bin: &str) -> Result<String> {
+    if bin.contains('\'') {
+        return Err(anyhow!("binary path contains a single quote, refusing to embed: {bin}"));
     }
-    Ok(PERL_TEMPLATE.replace("__MATRIRC_BIN__", bin_str))
+    Ok(PERL_TEMPLATE.replace("__MATRIRC_BIN__", bin))
 }
 
 fn irssi_paths() -> Result<(PathBuf, PathBuf)> {
@@ -313,19 +320,23 @@ fn irssi_paths() -> Result<(PathBuf, PathBuf)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
     #[test]
     fn render_substitutes_path() {
-        let s = render(Path::new("/opt/matrirc/bin/matrirc")).unwrap();
+        let s = render_from_str("/opt/matrirc/bin/matrirc").unwrap();
         assert!(s.contains("'/opt/matrirc/bin/matrirc'"));
         assert!(!s.contains("__MATRIRC_BIN__"));
     }
 
     #[test]
+    fn render_substitutes_bare_command() {
+        let s = render_from_str("matrirc").unwrap();
+        assert!(s.contains("'matrirc'"));
+    }
+
+    #[test]
     fn render_rejects_quote_injection() {
-        let bad = Path::new("/tmp/'; rm -rf /; echo '");
-        assert!(render(bad).is_err());
+        assert!(render_from_str("/tmp/'; rm -rf /; echo '").is_err());
     }
 
     #[test]

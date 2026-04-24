@@ -19,7 +19,7 @@ async fn main() -> Result<()> {
     let args = Cli::parse();
     match args.command.unwrap_or(Command::Run) {
         Command::Run => run().await,
-        Command::InstallIrssi { force, dry_run } => cli::install_irssi(force, dry_run),
+        Command::InstallIrssi { force, dry_run, bin } => cli::install_irssi(force, dry_run, bin),
         Command::Login { mxid, homeserver, token, skip_verify } => {
             cli::login(&mxid, homeserver.as_deref(), token, skip_verify).await
         }
