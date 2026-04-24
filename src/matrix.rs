@@ -499,6 +499,7 @@ pub async fn run_sync(
         }
     });
 
+
     let bridge_for_reactions = bridge.clone();
     client.add_event_handler(move |ev: SyncReactionEvent, room: Room| {
         let bridge = bridge_for_reactions.clone();

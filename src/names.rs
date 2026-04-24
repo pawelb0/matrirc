@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use anyhow::{anyhow, Context, Result};
@@ -61,7 +61,7 @@ pub fn default_store_path() -> Result<PathBuf> {
         .join("names.json"))
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct StoreData {
     rooms: HashMap<String, String>,
 }
@@ -92,9 +92,8 @@ impl NameStore {
         self.data.lock().unwrap().rooms.get(room.as_str()).cloned()
     }
 
-    /// Returns the channel name for this room, reusing the previous assignment
-    /// or creating a new one from `preferred`. Collisions are resolved with
-    /// a `_N` suffix before the ID suffix.
+    /// Returns the stable channel name for `room`, assigning `preferred` (or a
+    /// `_N`-suffixed variant on collision) on first seen. Persisted to disk.
     pub fn assign_or_get(&self, room: &RoomId, preferred: &str) -> Result<String> {
         let mut data = self.data.lock().unwrap();
         if let Some(existing) = data.rooms.get(room.as_str()) {
@@ -108,7 +107,7 @@ impl NameStore {
             n += 1;
         }
         data.rooms.insert(room.as_str().to_string(), candidate.clone());
-        let snapshot = data.clone_shallow();
+        let snapshot = data.clone();
         drop(data);
         self.save(&snapshot)?;
         Ok(candidate)
@@ -125,17 +124,6 @@ impl NameStore {
         std::fs::rename(&tmp, path).with_context(|| format!("rename to {}", path.display()))?;
         Ok(())
     }
-}
-
-impl StoreData {
-    fn clone_shallow(&self) -> Self {
-        Self { rooms: self.rooms.clone() }
-    }
-}
-
-#[allow(dead_code)]
-pub fn scratch_store_path(dir: &Path) -> PathBuf {
-    dir.join("names.json")
 }
 
 #[cfg(test)]

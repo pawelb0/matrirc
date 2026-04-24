@@ -124,16 +124,12 @@ impl Bridge {
         let _ = self.from_matrix.send(FromMatrix::RoomAdded { room, chan, topic });
     }
 
-    pub fn update_topic(&self, room: &RoomId, topic: String) -> Option<String> {
+    pub fn update_topic(&self, room: &RoomId, topic: String) {
         let mut m = self.mapping.write().unwrap();
-        let chan = m.room_to_chan.get(room).cloned()?;
+        let Some(chan) = m.room_to_chan.get(room).cloned() else { return; };
         m.set_topic(&chan, topic.clone());
         drop(m);
-        let _ = self.from_matrix.send(FromMatrix::TopicChanged {
-            chan: chan.clone(),
-            topic,
-        });
-        Some(chan)
+        let _ = self.from_matrix.send(FromMatrix::TopicChanged { chan, topic });
     }
 
     pub fn topic_for(&self, chan: &str) -> Option<String> {
@@ -173,7 +169,7 @@ impl Bridge {
         m.room_to_chan.contains_key(room) || m.dm_room_to_nick.contains_key(room)
     }
 
-    /// Snapshot of all (chan, room) for bulk auto-join (channels only, no DMs).
+    /// Channels only, no DMs — auto-join iterates this.
     pub fn snapshot(&self) -> Vec<(String, OwnedRoomId)> {
         self.mapping
             .read()
@@ -184,7 +180,6 @@ impl Bridge {
             .collect()
     }
 
-    /// Snapshot of DM count for summary messages.
     pub fn dm_count(&self) -> usize {
         self.mapping.read().unwrap().dm_room_to_nick.len()
     }
