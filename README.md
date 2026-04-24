@@ -95,15 +95,6 @@ registers, matrirc auto-joins every known channel on its behalf,
 backfills the last 200 messages, and attaches IRCv3 `@time=` tags if
 the client negotiated the cap.
 
-Inbound events route through the bridge and get emitted as `PRIVMSG`
-to every connection that joined the target channel. Outbound `PRIVMSG`
-matches channel name → room id (or nick → DM room id), then
-`room.send()`. DMs don't `JOIN` — each peer becomes an IRC query when
-the first message arrives (or when the client sends `/query`).
-
-Matrirc tracks a "we just sent this" event-id set so sync echoes of
-your own messages don't double-print in irssi.
-
 ## Paths
 
 ```
