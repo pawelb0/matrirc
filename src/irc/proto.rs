@@ -270,4 +270,49 @@ mod tests {
             assert_eq!(parsed, m);
         }
     }
+
+    use proptest::prelude::*;
+
+    fn arb_tag_value() -> impl Strategy<Value = String> {
+        prop::collection::vec(
+            any::<char>().prop_filter("no nul", |c| *c != '\0'),
+            0..20,
+        )
+        .prop_map(|v| v.into_iter().collect())
+    }
+
+    fn arb_trailing() -> impl Strategy<Value = String> {
+        prop::collection::vec(
+            any::<char>().prop_filter("no ctrl", |c| *c != '\0' && *c != '\r' && *c != '\n'),
+            0..30,
+        )
+        .prop_map(|v| v.into_iter().collect())
+    }
+
+    prop_compose! {
+        fn arb_message()(
+            tags in prop::collection::vec(
+                ("[a-z][a-z0-9-]{0,7}", arb_tag_value()),
+                0..3,
+            ),
+            prefix in prop::option::of("[a-zA-Z0-9.!@_-]{1,20}"),
+            command in prop_oneof!["[A-Z]{3,6}", "[0-9]{3}"],
+            middles in prop::collection::vec("[a-zA-Z0-9#&._-]{1,15}", 0..5),
+            trailing in prop::option::of(arb_trailing()),
+        ) -> Message {
+            let mut params = middles;
+            if let Some(t) = trailing { params.push(t); }
+            Message { tags, prefix, command, params }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(1000))]
+        #[test]
+        fn round_trip_any_valid_message(m in arb_message()) {
+            let wire = m.to_wire();
+            let parsed = Message::parse(&wire).expect("parse");
+            prop_assert_eq!(parsed, m);
+        }
+    }
 }
