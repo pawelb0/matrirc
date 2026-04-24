@@ -6,3 +6,4 @@ test_resources
 /scripts/
 /demo/*
 !/demo/demo.gif
+INTERNALS.md
