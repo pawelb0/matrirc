@@ -1,8 +1,8 @@
 class Matrirc < Formula
   desc "Local IRC server backed by Matrix"
   homepage "https://github.com/pawelb0/matrirc"
-  url "https://github.com/pawelb0/matrirc/archive/refs/tags/v0.1.3.tar.gz"
-  sha256 "36bdae78b00ee8ddfe53bae9d81768c2081abe992b4e9c35e32a9fe18b08a153"
+  url "https://github.com/pawelb0/matrirc/archive/refs/tags/v0.1.4.tar.gz"
+  sha256 "4b34687e0d269541afc258de80feb00436be622520d63872a1cc1ee7eba0fc4a"
   license "GPL-3.0-or-later"
   head "https://github.com/pawelb0/matrirc.git", branch: "main"
 
