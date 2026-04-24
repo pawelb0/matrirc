@@ -920,6 +920,89 @@ mod tests {
         assert!(out.contains("phobos"), "{out}");
     }
 
+    async fn dispatch(
+        cmd: &str,
+        bridge: &Bridge,
+        s: &mut State,
+    ) -> String {
+        let peer: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let msg = Message::parse(cmd).unwrap();
+        let mut out = Vec::<u8>::new();
+        handle_command(&mut out, &peer, bridge, &msg, s).await.unwrap();
+        drain(out).await
+    }
+
+    #[tokio::test]
+    async fn ping_replies_pong() {
+        let (b, _rx) = Bridge::new(Mapping::default());
+        let mut s = registered_state("pawelb");
+        let out = dispatch("PING :abc", &b, &mut s).await;
+        assert_eq!(out, ":matrirc.local PONG matrirc.local abc\r\n");
+    }
+
+    #[tokio::test]
+    async fn join_echo_channel_emits_ack_topic_names() {
+        let (b, _rx) = Bridge::new(Mapping::default());
+        let mut s = registered_state("pawelb");
+        let out = dispatch("JOIN #echo", &b, &mut s).await;
+        assert!(out.contains(":pawelb!pawelb@matrirc.local JOIN #echo"), "{out}");
+        assert!(out.contains(":matrirc.local 332 pawelb #echo"), "{out}");
+        assert!(out.contains(" echo"), "names list should include echo: {out}");
+        assert!(out.contains(":matrirc.local 366 pawelb #echo"), "{out}");
+        assert!(s.joined.contains("#echo"));
+    }
+
+    #[tokio::test]
+    async fn join_unknown_channel_returns_403() {
+        let (b, _rx) = Bridge::new(Mapping::default());
+        let mut s = registered_state("pawelb");
+        let out = dispatch("JOIN #nope", &b, &mut s).await;
+        assert!(out.contains(":matrirc.local 403 pawelb #nope"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn privmsg_echo_channel_echoes_back() {
+        let (b, _rx) = Bridge::new(Mapping::default());
+        let mut s = registered_state("pawelb");
+        let out = dispatch("PRIVMSG #echo :hi there", &b, &mut s).await;
+        assert!(out.contains(":echo!echo@matrirc.local PRIVMSG #echo :echo: hi there"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn privmsg_to_unknown_returns_401() {
+        let (b, _rx) = Bridge::new(Mapping::default());
+        let mut s = registered_state("pawelb");
+        let out = dispatch("PRIVMSG nobody :hello", &b, &mut s).await;
+        assert!(out.contains(":matrirc.local 401 pawelb nobody"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn privmsg_to_bot_help_lists_commands() {
+        let (b, _rx) = Bridge::new(Mapping::default());
+        let mut s = registered_state("pawelb");
+        let out = dispatch("PRIVMSG matrirc :help", &b, &mut s).await;
+        assert!(out.contains("matrirc — local Matrix↔IRC bridge"), "{out}");
+        assert!(out.contains("help"), "{out}");
+        assert!(out.contains("rooms"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn whois_echo_returns_311_and_318() {
+        let (b, _rx) = Bridge::new(Mapping::default());
+        let mut s = registered_state("pawelb");
+        let out = dispatch("WHOIS echo", &b, &mut s).await;
+        assert!(out.contains(":matrirc.local 311 pawelb echo"), "{out}");
+        assert!(out.contains(":matrirc.local 318 pawelb echo"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn ctcp_action_to_bot_is_silent() {
+        let (b, _rx) = Bridge::new(Mapping::default());
+        let mut s = registered_state("pawelb");
+        let out = dispatch("PRIVMSG matrirc :\x01ACTION waves\x01", &b, &mut s).await;
+        assert!(out.is_empty(), "bot should not emit for CTCP: {out:?}");
+    }
+
     #[tokio::test]
     async fn multi_line_body_produces_multiple_privmsg() {
         let (b, _rx) = Bridge::new(Mapping::default());
