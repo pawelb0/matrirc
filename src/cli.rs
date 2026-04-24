@@ -319,6 +319,6 @@ mod tests {
     fn template_has_placeholder_and_required_keys() {
         assert!(PERL_TEMPLATE.contains("__MATRIRC_BIN__"));
         assert!(PERL_TEMPLATE.contains("Irssi::timeout_add"));
-        assert!(PERL_TEMPLATE.contains("connect $HOST $PORT"));
+        assert!(PERL_TEMPLATE.contains("connect matrirc"));
     }
 }

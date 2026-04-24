@@ -26,10 +26,12 @@ matrirc login @you:homeserver.org
 matrirc run
 ```
 
-Then in your IRC client: `/connect 127.0.0.1`.
+In your IRC client: `/connect 127.0.0.1` (or `/connect matrirc` if you
+ran `matrirc install-irssi`, which registers a `matrirc` chatnet).
 
-`login` asks for your password, then walks you through an emoji
-verification in Element. Config lands in `~/.config/matrirc/config.toml`.
+`login` prompts for your password and walks you through emoji
+verification from another Element device. Config lands in
+`~/.config/matrirc/config.toml`.
 
 ## irssi helper
 
@@ -37,8 +39,13 @@ verification in Element. Config lands in `~/.config/matrirc/config.toml`.
 matrirc install-irssi
 ```
 
-Drops a Perl script into `~/.irssi/scripts/autorun/`. Starts the daemon
-on irssi load, reconnects on crash, kills it on `/quit`.
+Drops a Perl script into `~/.irssi/scripts/autorun/`. On irssi load it
+starts the daemon (if not already running), creates a persistent
+`matrirc` chatnet, runs `/connect matrirc`, reconnects on crash, and
+SIGTERMs the daemon on `/quit`.
+
+If you prefer not to autorun, skip `install-irssi` and just connect
+manually: `/connect 127.0.0.1 6667` from your IRC client of choice.
 
 ## Commands
 
