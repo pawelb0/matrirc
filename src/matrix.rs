@@ -727,9 +727,17 @@ pub async fn run_sync(
         }
     });
 
-    let settings = SyncSettings::default().token(initial.next_batch);
-    if let Err(e) = client.sync(settings).await {
-        warn!("sync ended: {e}");
+    let mut settings = SyncSettings::default().token(initial.next_batch);
+    loop {
+        match client.sync(settings.clone()).await {
+            Ok(()) => break, // sync() normally runs forever; Ok means explicit exit
+            Err(e) => {
+                warn!("sync error, retrying in 10s: {e:#}");
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                // Drop the initial since-token; SDK resumes from its own state.
+                settings = SyncSettings::default();
+            }
+        }
     }
     Ok(())
 }
