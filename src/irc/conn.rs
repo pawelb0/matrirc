@@ -432,12 +432,24 @@ async fn handle_bot_command(
         "" | "help" | "?" => {
             for line in [
                 "matrirc — local Matrix↔IRC bridge",
-                "commands:",
-                "  help                  this message",
-                "  rooms                 list bridged Matrix channels",
-                "  dms                   list known Matrix DMs",
+                "",
+                "bot commands (to this nick):",
+                "  help                          this message",
+                "  rooms                         list bridged Matrix channels",
+                "  dms                           list known Matrix DMs",
                 "  search <term> [on <server>]   public-room directory",
-                "  version               matrirc version",
+                "  version                       matrirc version",
+                "",
+                "IRC → Matrix:",
+                "  /join #alias:server.org       join any public Matrix room",
+                "  /msg @alice:server.org hi     open/create a DM",
+                "  /msg <known-dm-nick> hi       existing DM (see `dms`)",
+                "  /part #channel                leave the IRC channel (Matrix room keeps you)",
+                "  /me does a thing              m.emote",
+                "",
+                "daemon control (in your shell, not here):",
+                "  matrirc status | stop | verify | reset",
+                "docs: https://github.com/pawelb0/matrirc",
             ] {
                 matrirc_msg(write, nick, line).await?;
             }

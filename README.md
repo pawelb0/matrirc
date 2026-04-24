@@ -55,7 +55,47 @@ matrirc reset --force              wipe local state
 matrirc install-irssi              drop irssi script
 ```
 
-`/msg matrirc help` once connected for the bridge-side commands.
+Once connected, `/msg matrirc help` prints the full command reference
+from inside irssi. `/msg matrirc search <term>` queries the public-room
+directory; `/join #alias:server.org` joins any public Matrix room.
+`/msg @alice:server.org hi` opens or creates a DM.
+
+## How it works
+
+Matrirc is one long-running daemon with two tasks talking through a
+small bridge module:
+
+```
+  IRC client ─TCP─▶ irc::serve ─────▶ bridge ◀───── matrix::run_sync ◀─HTTPS/sync─ homeserver
+                       │                 ▲                │
+                       └──────PRIVMSG────┘                └─sqlite crypto/state store
+```
+
+- `matrix::run_sync` restores the session (from `config.toml`), runs
+  the Matrix sync loop, and keeps the sqlite crypto store under
+  `~/.local/share/matrirc/store/` in sync.
+- `irc::serve` accepts IRC clients on `127.0.0.1:6667`. Each client has
+  its own task + CAP/NICK/USER state.
+- `bridge` is a shared struct holding room↔channel + MXID↔nick maps
+  plus a `broadcast` channel for Matrix→IRC events and an `mpsc` for
+  IRC→Matrix commands.
+
+At startup the sync task walks every joined room, classifies each as
+channel or DM (`is_direct`), picks a stable channel name (slug of the
+display name + 6-char suffix from the room id, persisted in
+`names.json`), and pushes it into the mapping. When an IRC client
+registers, matrirc auto-joins every known channel on its behalf,
+backfills the last 200 messages, and attaches IRCv3 `@time=` tags if
+the client negotiated the cap.
+
+Inbound events route through the bridge and get emitted as `PRIVMSG`
+to every connection that joined the target channel. Outbound `PRIVMSG`
+matches channel name → room id (or nick → DM room id), then
+`room.send()`. DMs don't `JOIN` — each peer becomes an IRC query when
+the first message arrives (or when the client sends `/query`).
+
+Matrirc tracks a "we just sent this" event-id set so sync echoes of
+your own messages don't double-print in irssi.
 
 ## Paths
 
