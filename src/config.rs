@@ -12,7 +12,6 @@ pub struct Config {
 }
 
 impl Config {
-    #[allow(dead_code)] // used in Step 4 by the daemon when loading at startup
     pub fn load(path: &Path) -> Result<Self> {
         let s = std::fs::read_to_string(path)
             .with_context(|| format!("read {}", path.display()))?;

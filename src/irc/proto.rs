@@ -17,7 +17,7 @@ pub struct Message {
 }
 
 impl Message {
-    #[allow(dead_code)] // used in Step 2+ for client-bound messages without server prefix
+    #[cfg(test)]
     pub fn new(command: impl Into<String>, params: Vec<String>) -> Self {
         Self { tags: Vec::new(), prefix: None, command: command.into(), params }
     }
