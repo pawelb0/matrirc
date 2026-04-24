@@ -418,11 +418,14 @@ async fn handle_bot_command(
             }
         }
         "dms" => {
-            let count = bridge.dm_count();
-            if count == 0 {
+            let nicks = bridge.dm_nicks();
+            if nicks.is_empty() {
                 matrirc_msg(write, nick, "no DMs registered").await?;
             } else {
-                matrirc_msg(write, nick, &format!("{count} DM(s): use /msg <nick> to talk")).await?;
+                matrirc_msg(write, nick, &format!("{} DM(s):", nicks.len())).await?;
+                for n in nicks {
+                    matrirc_msg(write, nick, &format!("  /msg {n}")).await?;
+                }
             }
         }
         "version" => {
@@ -532,15 +535,26 @@ async fn handle_privmsg(
         return Ok(());
     }
 
-    let room = bridge.room_for(target).or_else(|| bridge.dm_room_for(target));
-    let Some(room) = room else {
-        send(write, srv("401", vec![nick.into(), target.clone(), "No such nick/channel".into()])).await?;
+    if let Some(room) = bridge.room_for(target).or_else(|| bridge.dm_room_for(target)) {
+        if let Err(e) = bridge.to_matrix.try_send(ToMatrix::Send { room, body: text.clone() }) {
+            warn!("dropping outbound matrix message: {e}");
+            send(write, srv("NOTICE", vec![nick.into(), format!("send dropped: {e}")])).await?;
+        }
         return Ok(());
-    };
-    if let Err(e) = bridge.to_matrix.try_send(ToMatrix::Send { room, body: text.clone() }) {
-        warn!("dropping outbound matrix message: {e}");
-        send(write, srv("NOTICE", vec![nick.into(), format!("send dropped: {e}")])).await?;
     }
+
+    // Explicit MXID target like `@alice:server.org` — open or create a DM.
+    if target.starts_with('@') {
+        if let Ok(mxid) = matrix_sdk::ruma::OwnedUserId::try_from(target.as_str()) {
+            if let Err(e) = bridge.to_matrix.try_send(ToMatrix::SendToMxid { mxid, body: text.clone() }) {
+                warn!("dropping outbound DM to MXID: {e}");
+                send(write, srv("NOTICE", vec![nick.into(), format!("send dropped: {e}")])).await?;
+            }
+            return Ok(());
+        }
+    }
+
+    send(write, srv("401", vec![nick.into(), target.clone(), "No such nick/channel".into()])).await?;
     Ok(())
 }
 

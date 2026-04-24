@@ -175,6 +175,52 @@ fn strip_reply_fallback(body: &str) -> String {
     }
 }
 
+async fn send_to_mxid(
+    client: &Client,
+    bridge: &Bridge,
+    mxid: &matrix_sdk::ruma::UserId,
+    body: &str,
+) {
+    let room = match existing_dm_room(client, mxid).await {
+        Some(r) => r,
+        None => match client.create_dm(mxid).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("create_dm {mxid} failed: {e:#}");
+                notify_failure(bridge, mxid.as_str(), &format!("could not start DM: {e}"));
+                return;
+            }
+        },
+    };
+    let rid = room.room_id().to_owned();
+    let nick = dm_peer_nick(client, &room)
+        .await
+        .unwrap_or_else(|| mxid_localpart(mxid.as_str()).to_string());
+    bridge.add_dm(rid.clone(), nick);
+    send_to_room(client, bridge, &rid, body).await;
+}
+
+async fn existing_dm_room(client: &Client, mxid: &matrix_sdk::ruma::UserId) -> Option<Room> {
+    for room in client.rooms() {
+        if !room.is_direct().await.unwrap_or(false) {
+            continue;
+        }
+        let members = room.members(RoomMemberships::JOIN | RoomMemberships::INVITE).await.ok()?;
+        if members.iter().any(|m| m.user_id() == mxid) {
+            return Some(room);
+        }
+    }
+    None
+}
+
+fn notify_failure(bridge: &Bridge, dest: &str, reason: &str) {
+    let _ = bridge.from_matrix.send(FromMatrix::Message {
+        room: matrix_sdk::ruma::OwnedRoomId::try_from("!local:matrirc.local").unwrap(),
+        sender_nick: "matrirc".into(),
+        body: format!("[to {dest}] {reason}"),
+    });
+}
+
 async fn send_to_room(
     client: &Client,
     bridge: &Bridge,
@@ -223,10 +269,13 @@ async fn dm_peer_nick(client: &Client, room: &Room) -> Option<String> {
         .members(RoomMemberships::JOIN | RoomMemberships::INVITE)
         .await
         .ok()?;
-    members
-        .into_iter()
-        .find(|m| m.user_id() != me)
-        .map(|m| mxid_localpart(m.user_id().as_str()).to_string())
+    // Must match sender_nick()'s output: display name (sanitized) first, MXID
+    // localpart fallback. Otherwise /msg <nick> won't route to the same room
+    // that inbound messages appear from.
+    members.into_iter().find(|m| m.user_id() != me).map(|m| match m.display_name() {
+        Some(d) => sanitize_nick(d),
+        None => mxid_localpart(m.user_id().as_str()).to_string(),
+    })
 }
 
 async fn backfill(
@@ -522,12 +571,17 @@ pub async fn run_sync(
     client.add_event_handler(move |ev: SyncRoomEncryptedEvent, room: Room| {
         let bridge = bridge_for_utd.clone();
         async move {
-            if !bridge.has_room(room.room_id()) { return; }
+            let rid = room.room_id();
+            if !bridge.has_room(rid) {
+                tracing::debug!(%rid, "drop UTD: room not mapped");
+                return;
+            }
             let Some(orig) = ev.as_original() else { return; };
             if bridge.take_if_sent_by_us(&orig.event_id) { return; }
             let nick = sender_nick(&room, &orig.sender).await;
+            tracing::info!(%rid, %nick, "inbound UTD (no key)");
             let _ = bridge.from_matrix.send(FromMatrix::Message {
-                room: room.room_id().to_owned(),
+                room: rid.to_owned(),
                 sender_nick: nick,
                 body: format!("{C_RED}[encrypted — run `matrirc bootstrap-e2ee` once to decrypt]{C_RESET}"),
             });
@@ -540,22 +594,23 @@ pub async fn run_sync(
         let bridge = bridge_for_handler.clone();
         let homeserver = homeserver_for_handler.clone();
         async move {
-            if !bridge.has_room(room.room_id()) {
+            let rid = room.room_id();
+            if !bridge.has_room(rid) {
+                tracing::debug!(%rid, "drop: room not mapped");
                 return;
             }
             let Some(orig) = ev.as_original() else { return; };
-            // Only suppress our own IRC-originated sends (matched by event id).
-            // Messages from other devices on the same MXID still flow through.
             if bridge.take_if_sent_by_us(&orig.event_id) {
                 return;
             }
-            let body = match body_from_event(&orig.content, &homeserver) {
-                Some(b) => b,
-                None => return,
+            let Some(body) = body_from_event(&orig.content, &homeserver) else {
+                tracing::debug!(%rid, "drop: unsupported msgtype");
+                return;
             };
             let nick = sender_nick(&room, &orig.sender).await;
+            tracing::info!(%rid, %nick, bytes = body.len(), "inbound message");
             let _ = bridge.from_matrix.send(FromMatrix::Message {
-                room: room.room_id().to_owned(),
+                room: rid.to_owned(),
                 sender_nick: nick,
                 body,
             });
@@ -570,6 +625,9 @@ pub async fn run_sync(
             match cmd {
                 ToMatrix::Send { room, body } => {
                     send_to_room(&send_client, &send_bridge, &room, &body).await;
+                }
+                ToMatrix::SendToMxid { mxid, body } => {
+                    send_to_mxid(&send_client, &send_bridge, &mxid, &body).await;
                 }
                 ToMatrix::Backfill { room, limit, reply } => {
                     let result = backfill(&send_client, &room, limit, &homeserver_for_sender).await;

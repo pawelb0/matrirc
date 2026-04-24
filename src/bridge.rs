@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
 
-use matrix_sdk::ruma::{EventId, OwnedEventId, OwnedRoomId, RoomId};
+use matrix_sdk::ruma::{EventId, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 const RECENT_SENT_CAP: usize = 256;
@@ -73,6 +73,10 @@ pub enum FromMatrix {
 pub enum ToMatrix {
     Send {
         room: OwnedRoomId,
+        body: String,
+    },
+    SendToMxid {
+        mxid: OwnedUserId,
         body: String,
     },
     Backfill {
@@ -182,6 +186,13 @@ impl Bridge {
 
     pub fn dm_count(&self) -> usize {
         self.mapping.read().unwrap().dm_room_to_nick.len()
+    }
+
+    pub fn dm_nicks(&self) -> Vec<String> {
+        let m = self.mapping.read().unwrap();
+        let mut v: Vec<String> = m.dm_room_to_nick.values().cloned().collect();
+        v.sort();
+        v
     }
 
     pub fn note_sent_by_us(&self, id: OwnedEventId) {
