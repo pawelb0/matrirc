@@ -663,9 +663,10 @@ fn hostname() -> Option<String> {
     })
 }
 
-/// Prints encryption posture + hints. Runs a few short extra syncs first to
-/// catch any to-device secret-send that arrived around verification time.
-pub async fn print_encryption_state_and_try_recover(client: &Client) {
+/// Prints encryption posture + actionable hints. Does a couple of short extra
+/// syncs first so any to-device secret-send in flight gets applied before we
+/// read the state.
+pub async fn report_encryption_state(client: &Client) {
     use matrix_sdk::encryption::recovery::RecoveryState;
     use std::time::Duration;
 

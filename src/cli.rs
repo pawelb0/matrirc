@@ -85,33 +85,21 @@ pub async fn login(
 
     let path = config_path()?;
     cfg.save(&path)?;
-    println!(
-        "✓ logged in as {} (device {}) on {}",
-        cfg.mxid, cfg.device_id, cfg.homeserver_url
-    );
-    println!("  config written to {}", path.display());
+    println!("✓ {} (device {}) on {}", cfg.mxid, cfg.device_id, cfg.homeserver_url);
+    println!("  config: {}", path.display());
 
     if skip_verify {
-        println!();
-        println!("--skip-verify set. Encrypted rooms won't decrypt until you run");
-        println!("  matrirc bootstrap-e2ee   (recovery-key path)   OR");
-        println!("  matrirc login --skip-verify=false  (to re-run SAS verification).");
+        println!("\n--skip-verify: E2EE rooms won't decrypt until `matrirc verify` or bootstrap-e2ee.");
         return Ok(());
     }
 
     println!();
     match matrix::run_sas_bootstrap(&client).await {
-        Ok(true) => {
-            println!("✓ device verified. E2EE ready. Start the daemon with `matrirc run`.");
-        }
-        Ok(false) => {
-            println!("device is already trusted. E2EE ready. Start the daemon with `matrirc run`.");
-        }
+        Ok(true) => println!("✓ device verified. run `matrirc run`."),
+        Ok(false) => println!("device already trusted. run `matrirc run`."),
         Err(e) => {
-            println!("× SAS verification didn't finish: {e}");
-            println!("  Encrypted rooms won't decrypt until you retry. Options:");
-            println!("    matrirc login    # retry SAS verification");
-            println!("    matrirc bootstrap-e2ee    # paste your recovery key instead");
+            println!("× SAS didn't finish: {e}");
+            println!("  retry with `matrirc verify` or `matrirc bootstrap-e2ee`.");
         }
     }
     Ok(())
@@ -179,7 +167,7 @@ pub async fn verify() -> Result<()> {
 
     println!();
     println!("checking what we have ...");
-    matrix::print_encryption_state_and_try_recover(&client).await;
+    matrix::report_encryption_state(&client).await;
 
     if sas_outcome.is_err() {
         return sas_outcome.map(|_| ());
@@ -254,13 +242,7 @@ pub fn reset(force: bool) -> Result<()> {
         }
     }
 
-    println!();
-    println!("next steps:");
-    println!("  1. Element → Settings → Sessions → sign out the old matrirc device.");
-    println!("  2. matrirc login @you:server.org");
-    println!("       prompts for password, then walks you through emoji verification");
-    println!("       from another Element device to enable E2EE rooms.");
-    println!("  3. matrirc run");
+    println!("\nnext: Element → Sessions → sign out old matrirc device, then `matrirc login`.");
     Ok(())
 }
 
