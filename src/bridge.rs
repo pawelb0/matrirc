@@ -74,10 +74,12 @@ pub enum ToMatrix {
     Send {
         room: OwnedRoomId,
         body: String,
+        emote: bool,
     },
     SendToMxid {
         mxid: OwnedUserId,
         body: String,
+        emote: bool,
     },
     Backfill {
         room: OwnedRoomId,

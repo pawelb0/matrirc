@@ -202,6 +202,7 @@ async fn send_to_mxid(
     bridge: &Bridge,
     mxid: &matrix_sdk::ruma::UserId,
     body: &str,
+    emote: bool,
 ) {
     let room = match find_or_create_dm(client, mxid).await {
         Ok(r) => r,
@@ -214,8 +215,12 @@ async fn send_to_mxid(
     let nick = dm_peer_nick(client, &room)
         .await
         .unwrap_or_else(|| mxid_localpart(mxid.as_str()).to_string());
+    // Tell the user which nick replies will arrive under (irssi opens a query
+    // under the original typed target, which is the MXID; replies come from
+    // `nick` which is a different window).
+    let _ = bridge.from_matrix.send(FromMatrix::DmAdded { nick: nick.clone() });
     bridge.add_dm(rid.clone(), nick);
-    send_to_room(client, bridge, &rid, body).await;
+    send_to_room(client, bridge, &rid, body, emote).await;
 }
 
 async fn find_or_create_dm(client: &Client, mxid: &matrix_sdk::ruma::UserId) -> Result<Room> {
@@ -238,12 +243,17 @@ async fn send_to_room(
     bridge: &Bridge,
     room_id: &matrix_sdk::ruma::RoomId,
     body: &str,
+    emote: bool,
 ) {
     let Some(room) = client.get_room(room_id) else {
         warn!("matrix room not found: {room_id}");
         return;
     };
-    let content = RoomMessageEventContent::text_plain(body);
+    let content = if emote {
+        RoomMessageEventContent::emote_plain(body)
+    } else {
+        RoomMessageEventContent::text_plain(body)
+    };
     match room.send(content).await {
         Ok(resp) => bridge.note_sent_by_us(resp.event_id),
         Err(e) => {
@@ -671,11 +681,11 @@ pub async fn run_sync(
     tokio::spawn(async move {
         while let Some(cmd) = to_matrix.recv().await {
             match cmd {
-                ToMatrix::Send { room, body } => {
-                    send_to_room(&send_client, &send_bridge, &room, &body).await;
+                ToMatrix::Send { room, body, emote } => {
+                    send_to_room(&send_client, &send_bridge, &room, &body, emote).await;
                 }
-                ToMatrix::SendToMxid { mxid, body } => {
-                    send_to_mxid(&send_client, &send_bridge, &mxid, &body).await;
+                ToMatrix::SendToMxid { mxid, body, emote } => {
+                    send_to_mxid(&send_client, &send_bridge, &mxid, &body, emote).await;
                 }
                 ToMatrix::Backfill { room, limit, reply } => {
                     let result = backfill(&send_client, &room, limit, &homeserver_for_sender).await;

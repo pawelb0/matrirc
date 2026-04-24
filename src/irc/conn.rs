@@ -651,25 +651,27 @@ async fn handle_privmsg(
     bridge: &Bridge,
 ) -> Result<()> {
     let Some(target) = msg.params.first() else { return Ok(()); };
-    let Some(text) = msg.params.get(1) else { return Ok(()); };
+    let Some(raw) = msg.params.get(1) else { return Ok(()); };
+    let (body, emote) = strip_ctcp_action(raw);
 
     if target == ECHO_CHAN || target.eq_ignore_ascii_case(ECHO_NICK) {
         let dest: &str = if target == ECHO_CHAN { ECHO_CHAN } else { nick };
-        let body = format!("echo: {text}");
-        send(write, Message::with_prefix(ECHO_PREFIX, "PRIVMSG", vec![dest.into(), body])).await?;
+        send(write, Message::with_prefix(ECHO_PREFIX, "PRIVMSG", vec![dest.into(), format!("echo: {body}")])).await?;
         return Ok(());
     }
     if target.eq_ignore_ascii_case("matrirc") {
-        return handle_bot_command(write, nick, text, bridge).await;
+        if emote { return Ok(()); }
+        return handle_bot_command(write, nick, &body, bridge).await;
     }
 
+    let body = body.to_string();
     let cmd = if let Some(room) = bridge.room_for(target).or_else(|| bridge.dm_room_for(target)) {
-        ToMatrix::Send { room, body: text.clone() }
+        ToMatrix::Send { room, body, emote }
     } else if target.contains(':') {
         // irssi strips leading '@' in /query; accept both forms.
-        let canonical = if target.starts_with('@') { target.clone() } else { format!("@{target}") };
+        let canonical = if target.starts_with('@') { target.into() } else { format!("@{target}") };
         match matrix_sdk::ruma::OwnedUserId::try_from(canonical.as_str()) {
-            Ok(mxid) => ToMatrix::SendToMxid { mxid, body: text.clone() },
+            Ok(mxid) => ToMatrix::SendToMxid { mxid, body, emote },
             Err(_) => return no_such(write, nick, target).await,
         }
     } else {
@@ -681,6 +683,13 @@ async fn handle_privmsg(
         send(write, srv("NOTICE", vec![nick.into(), format!("send dropped: {e}")])).await?;
     }
     Ok(())
+}
+
+fn strip_ctcp_action(text: &str) -> (&str, bool) {
+    text.strip_prefix("\x01ACTION ")
+        .and_then(|s| s.strip_suffix('\x01'))
+        .map(|s| (s, true))
+        .unwrap_or((text, false))
 }
 
 async fn no_such(write: &mut OwnedWriteHalf, nick: &str, target: &str) -> Result<()> {
