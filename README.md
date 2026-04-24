@@ -115,7 +115,9 @@ Rust 1.95+. First build pulls matrix-sdk, takes a few minutes.
 
 ## Caveats
 
-- Password login only. No SSO, no QR sign-in. matrix.org won't work.
+- No SSO / OIDC / QR sign-in. On homeservers that only advertise those
+  (matrix.org, anything behind MAS), grab an access token from Element
+  and run `matrirc login ... --token`.
 - Single account per daemon.
 - IRC listener binds `127.0.0.1` without TLS. Don't expose it.
 
