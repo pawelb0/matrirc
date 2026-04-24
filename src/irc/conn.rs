@@ -654,69 +654,66 @@ async fn handle_privmsg(
     let Some(text) = msg.params.get(1) else { return Ok(()); };
 
     if target == ECHO_CHAN || target.eq_ignore_ascii_case(ECHO_NICK) {
-        let echo_target: &str = if target == ECHO_CHAN { ECHO_CHAN } else { nick };
+        let dest: &str = if target == ECHO_CHAN { ECHO_CHAN } else { nick };
         let body = format!("echo: {text}");
-        send(write, Message::with_prefix(ECHO_PREFIX, "PRIVMSG", vec![echo_target.into(), body])).await?;
+        send(write, Message::with_prefix(ECHO_PREFIX, "PRIVMSG", vec![dest.into(), body])).await?;
         return Ok(());
     }
-
     if target.eq_ignore_ascii_case("matrirc") {
-        handle_bot_command(write, nick, text, bridge).await?;
-        return Ok(());
+        return handle_bot_command(write, nick, text, bridge).await;
     }
 
-    if let Some(room) = bridge.room_for(target).or_else(|| bridge.dm_room_for(target)) {
-        if let Err(e) = bridge.to_matrix.try_send(ToMatrix::Send { room, body: text.clone() }) {
-            warn!("dropping outbound matrix message: {e}");
-            send(write, srv("NOTICE", vec![nick.into(), format!("send dropped: {e}")])).await?;
-        }
-        return Ok(());
-    }
-
-    // Explicit MXID target (`@alice:server.org` or bare `alice:server.org`) →
-    // open or create a DM. irssi strips leading '@' in /query, accept both.
-    if target.contains(':') {
+    let cmd = if let Some(room) = bridge.room_for(target).or_else(|| bridge.dm_room_for(target)) {
+        ToMatrix::Send { room, body: text.clone() }
+    } else if target.contains(':') {
+        // irssi strips leading '@' in /query; accept both forms.
         let canonical = if target.starts_with('@') { target.clone() } else { format!("@{target}") };
-        if let Ok(mxid) = matrix_sdk::ruma::OwnedUserId::try_from(canonical.as_str()) {
-            if let Err(e) = bridge.to_matrix.try_send(ToMatrix::SendToMxid { mxid, body: text.clone() }) {
-                warn!("dropping outbound DM to MXID: {e}");
-                send(write, srv("NOTICE", vec![nick.into(), format!("send dropped: {e}")])).await?;
-            }
-            return Ok(());
+        match matrix_sdk::ruma::OwnedUserId::try_from(canonical.as_str()) {
+            Ok(mxid) => ToMatrix::SendToMxid { mxid, body: text.clone() },
+            Err(_) => return no_such(write, nick, target).await,
         }
-    }
+    } else {
+        return no_such(write, nick, target).await;
+    };
 
-    send(write, srv("401", vec![nick.into(), target.clone(), "No such nick/channel".into()])).await?;
+    if let Err(e) = bridge.to_matrix.try_send(cmd) {
+        warn!("dropping outbound: {e}");
+        send(write, srv("NOTICE", vec![nick.into(), format!("send dropped: {e}")])).await?;
+    }
     Ok(())
+}
+
+async fn no_such(write: &mut OwnedWriteHalf, nick: &str, target: &str) -> Result<()> {
+    send(write, srv("401", vec![nick.into(), target.into(), "No such nick/channel".into()])).await
 }
 
 async fn read_line<R: tokio::io::AsyncBufRead + Unpin>(
     lines: &mut tokio::io::Lines<R>,
 ) -> Result<Option<String>> {
-    match lines.next_line().await.context("read line")? {
-        Some(line) => {
-            if line.len() > MAX_LINE {
-                warn!(len = line.len(), "line exceeded max length, truncating");
-                Ok(Some(line.chars().take(MAX_LINE).collect()))
-            } else {
-                Ok(Some(line))
-            }
-        }
-        None => Ok(None),
+    let Some(line) = lines.next_line().await.context("read line")? else { return Ok(None) };
+    if line.len() > MAX_LINE {
+        warn!(len = line.len(), "line over {MAX_LINE}; truncating");
+        return Ok(Some(line.chars().take(MAX_LINE).collect()));
     }
+    Ok(Some(line))
 }
 
 async fn send_welcome(write: &mut OwnedWriteHalf, nick: &str) -> Result<()> {
     let n = nick.to_string();
-    send(write, srv("001", vec![n.clone(), format!("Welcome to matrirc, {nick}")])).await?;
-    send(write, srv("002", vec![n.clone(), format!("Your host is {SERVER_NAME}, running {VERSION}")])).await?;
-    send(write, srv("003", vec![n.clone(), "This server has no creation date".into()])).await?;
-    send(write, srv("004", vec![n.clone(), SERVER_NAME.into(), VERSION.into(), "".into(), "".into()])).await?;
-    send(write, srv("375", vec![n.clone(), format!("- {SERVER_NAME} Message of the day -")])).await?;
-    send(write, srv("372", vec![n.clone(), "- matrirc: Matrix rooms auto-joined after this line.".into()])).await?;
-    send(write, srv("372", vec![n.clone(), "- /msg matrirc help  for bridge commands.".into()])).await?;
-    send(write, srv("372", vec![n.clone(), format!("- /join {ECHO_CHAN}  for a local echo channel.")])).await?;
-    send(write, srv("376", vec![n, "End of /MOTD command.".into()])).await?;
+    let lines: &[(&str, Vec<String>)] = &[
+        ("001", vec![n.clone(), format!("Welcome to matrirc, {nick}")]),
+        ("002", vec![n.clone(), format!("Your host is {SERVER_NAME}, running {VERSION}")]),
+        ("003", vec![n.clone(), "This server has no creation date".into()]),
+        ("004", vec![n.clone(), SERVER_NAME.into(), VERSION.into(), String::new(), String::new()]),
+        ("375", vec![n.clone(), format!("- {SERVER_NAME} Message of the day -")]),
+        ("372", vec![n.clone(), "- Matrix rooms auto-joined after this line.".into()]),
+        ("372", vec![n.clone(), "- /msg matrirc help  for bridge commands.".into()]),
+        ("372", vec![n.clone(), format!("- /join {ECHO_CHAN}  for a local echo channel.")]),
+        ("376", vec![n, "End of /MOTD command.".into()]),
+    ];
+    for (code, params) in lines {
+        send(write, srv(code, params.clone())).await?;
+    }
     Ok(())
 }
 

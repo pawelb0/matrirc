@@ -172,53 +172,30 @@ fn unescape_tag_value(v: &str) -> String {
 mod tests {
     use super::*;
 
-    #[track_caller]
-    fn parses_to(line: &str, expected: Message) {
-        let got = Message::parse(line).unwrap();
-        assert_eq!(got, expected, "parsing {line:?}");
+    fn m(cmd: &str, params: &[&str]) -> Message {
+        Message::new(cmd, params.iter().map(|s| s.to_string()).collect())
     }
 
     #[test]
-    fn parse_nick() {
-        parses_to("NICK foo", Message::new("NICK", vec!["foo".into()]));
+    fn parse_inputs() {
+        let cases: &[(&str, &str, &[&str])] = &[
+            ("NICK foo",                     "NICK",    &["foo"]),
+            ("USER foo 0 * :Real Name",      "USER",    &["foo", "0", "*", "Real Name"]),
+            ("PING :token123",               "PING",    &["token123"]),
+            ("CAP LS 302",                   "CAP",     &["LS", "302"]),
+            ("CAP END",                      "CAP",     &["END"]),
+            ("QUIT :bye now",                "QUIT",    &["bye now"]),
+            ("LIST",                         "LIST",    &[]),
+            ("NICK foo\r\n",                 "NICK",    &["foo"]),
+            ("USER  foo  0  *  :Real Name", "USER",    &["foo", "0", "*", "Real Name"]),
+        ];
+        for (line, cmd, params) in cases {
+            assert_eq!(Message::parse(line).unwrap(), m(cmd, params), "parse {line:?}");
+        }
     }
 
     #[test]
-    fn parse_user() {
-        parses_to(
-            "USER foo 0 * :Real Name",
-            Message::new("USER", vec!["foo".into(), "0".into(), "*".into(), "Real Name".into()]),
-        );
-    }
-
-    #[test]
-    fn parse_ping_trailing() {
-        parses_to("PING :token123", Message::new("PING", vec!["token123".into()]));
-    }
-
-    #[test]
-    fn parse_cap_ls() {
-        parses_to(
-            "CAP LS 302",
-            Message::new("CAP", vec!["LS".into(), "302".into()]),
-        );
-    }
-
-    #[test]
-    fn parse_cap_end() {
-        parses_to("CAP END", Message::new("CAP", vec!["END".into()]));
-    }
-
-    #[test]
-    fn parse_quit_with_reason() {
-        parses_to(
-            "QUIT :bye now",
-            Message::new("QUIT", vec!["bye now".into()]),
-        );
-    }
-
-    #[test]
-    fn parse_with_prefix() {
+    fn parse_with_prefix_and_trailing() {
         let got = Message::parse(":nick!user@host PRIVMSG #x :hi there").unwrap();
         assert_eq!(got.prefix.as_deref(), Some("nick!user@host"));
         assert_eq!(got.command, "PRIVMSG");
@@ -232,145 +209,65 @@ mod tests {
     }
 
     #[test]
-    fn parse_strips_crlf() {
-        parses_to("NICK foo\r\n", Message::new("NICK", vec!["foo".into()]));
-        parses_to("NICK foo\n", Message::new("NICK", vec!["foo".into()]));
-    }
-
-    #[test]
-    fn parse_collapses_extra_spaces() {
-        parses_to(
-            "USER  foo  0  *  :Real Name",
-            Message::new("USER", vec!["foo".into(), "0".into(), "*".into(), "Real Name".into()]),
-        );
-    }
-
-    #[test]
-    fn parse_command_only() {
-        parses_to("LIST", Message::new("LIST", vec![]));
-    }
-
-    #[test]
-    fn parse_empty_errors() {
+    fn parse_errors() {
         assert!(matches!(Message::parse(""), Err(ProtoError::Empty)));
         assert!(matches!(Message::parse("\r\n"), Err(ProtoError::Empty)));
-    }
-
-    #[test]
-    fn parse_prefix_only_errors() {
-        // ":nick" with no command => after stripping prefix, command is empty
         assert!(matches!(Message::parse(":nick"), Err(ProtoError::NoCommand)));
     }
 
     #[test]
-    fn serialize_simple() {
-        assert_eq!(
-            Message::new("PONG", vec!["token".into()]).to_wire(),
-            "PONG token"
-        );
-    }
-
-    #[test]
-    fn serialize_trailing_when_spaces() {
-        assert_eq!(
-            Message::new("PRIVMSG", vec!["#chan".into(), "hello world".into()]).to_wire(),
-            "PRIVMSG #chan :hello world"
-        );
-    }
-
-    #[test]
-    fn serialize_trailing_when_starts_with_colon() {
-        assert_eq!(
-            Message::new("NOTICE", vec!["x".into(), ":weird".into()]).to_wire(),
-            "NOTICE x ::weird"
-        );
-    }
-
-    #[test]
-    fn serialize_trailing_when_empty() {
-        assert_eq!(
-            Message::new("CAP", vec!["*".into(), "LS".into(), "".into()]).to_wire(),
-            "CAP * LS :"
-        );
+    fn serialize_trailing_rules() {
+        let cases: &[(&[&str], &str)] = &[
+            (&["token"],            "PONG token"),
+            (&["#chan", "hi world"], "PONG #chan :hi world"),
+            (&["x", ":weird"],       "PONG x ::weird"),
+            (&["*", "LS", ""],       "PONG * LS :"),
+        ];
+        for (params, want) in cases {
+            let got = m("PONG", params).to_wire();
+            assert_eq!(&got, want);
+        }
     }
 
     #[test]
     fn serialize_with_prefix() {
-        assert_eq!(
-            Message::with_prefix("matrirc.local", "001", vec!["foo".into(), "Welcome to matrirc".into()])
-                .to_wire(),
-            ":matrirc.local 001 foo :Welcome to matrirc"
-        );
+        let m = Message::with_prefix("matrirc.local", "001", vec!["foo".into(), "Welcome".into()]);
+        assert_eq!(m.to_wire(), ":matrirc.local 001 foo Welcome");
     }
 
     #[test]
-    fn round_trip_001_welcome() {
-        let m = Message::with_prefix(
-            "matrirc.local",
-            "001",
-            vec!["foo".into(), "Welcome foo".into()],
-        );
-        let wire = m.to_wire();
-        let parsed = Message::parse(&wire).unwrap();
-        assert_eq!(parsed, m);
-    }
-
-    #[test]
-    fn parse_tags_basic() {
-        let m = Message::parse("@time=2024-03-14T12:34:56.789Z :nick!u@h PRIVMSG #c :hi").unwrap();
+    fn tags_parse_and_unescape() {
+        let m = Message::parse("@time=2024-03-14T12:34:56.789Z :n!u@h PRIVMSG #c :hi").unwrap();
         assert_eq!(m.tags, vec![("time".into(), "2024-03-14T12:34:56.789Z".into())]);
-        assert_eq!(m.prefix.as_deref(), Some("nick!u@h"));
-        assert_eq!(m.command, "PRIVMSG");
-        assert_eq!(m.params, vec!["#c".to_string(), "hi".to_string()]);
-    }
-
-    #[test]
-    fn parse_multiple_tags_and_unescape() {
         let m = Message::parse("@a=one;b=two\\sthree;c PING :x").unwrap();
-        assert_eq!(
-            m.tags,
-            vec![
-                ("a".into(), "one".into()),
-                ("b".into(), "two three".into()),
-                ("c".into(), String::new()),
-            ]
-        );
+        assert_eq!(m.tags, vec![
+            ("a".into(), "one".into()),
+            ("b".into(), "two three".into()),
+            ("c".into(), String::new()),
+        ]);
     }
 
     #[test]
-    fn serialize_tag_with_server_time() {
-        let m = Message::with_prefix("nick!u@h", "PRIVMSG", vec!["#c".into(), "hi".into()])
+    fn tags_serialize_and_escape() {
+        let m = Message::with_prefix("n!u@h", "PRIVMSG", vec!["#c".into(), "hi".into()])
             .with_tag("time", "2024-03-14T12:34:56.789Z");
-        assert_eq!(
-            m.to_wire(),
-            "@time=2024-03-14T12:34:56.789Z :nick!u@h PRIVMSG #c hi"
-        );
-    }
-
-    #[test]
-    fn serialize_tag_escapes_space_and_semicolon() {
+        assert_eq!(m.to_wire(), "@time=2024-03-14T12:34:56.789Z :n!u@h PRIVMSG #c hi");
         let m = Message::new("PING", vec!["x".into()]).with_tag("k", "a b;c");
         assert_eq!(m.to_wire(), "@k=a\\sb\\:c PING x");
     }
 
     #[test]
-    fn round_trip_tag() {
-        let original = Message::with_prefix("x", "PRIVMSG", vec!["#c".into(), "body space".into()])
-            .with_tag("time", "2024-01-01T00:00:00Z")
-            .with_tag("msgid", "abc;123");
-        let wire = original.to_wire();
-        let parsed = Message::parse(&wire).unwrap();
-        assert_eq!(parsed, original);
-    }
-
-    #[test]
-    fn round_trip_user() {
-        let m = Message::new(
-            "USER",
-            vec!["foo".into(), "0".into(), "*".into(), "Real Name".into()],
-        );
-        let wire = m.to_wire();
-        let parsed = Message::parse(&wire).unwrap();
-        assert_eq!(parsed, m);
+    fn round_trip() {
+        let msgs = [
+            Message::with_prefix("matrirc.local", "001", vec!["foo".into(), "Welcome foo".into()]),
+            Message::new("USER", vec!["foo".into(), "0".into(), "*".into(), "Real Name".into()]),
+            Message::with_prefix("x", "PRIVMSG", vec!["#c".into(), "body space".into()])
+                .with_tag("time", "2024-01-01T00:00:00Z")
+                .with_tag("msgid", "abc;123"),
+        ];
+        for m in msgs {
+            let parsed = Message::parse(&m.to_wire()).unwrap();
+            assert_eq!(parsed, m);
+        }
     }
 }

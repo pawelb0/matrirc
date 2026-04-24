@@ -182,13 +182,9 @@ pub async fn verify() -> Result<()> {
 pub fn status() -> Result<()> {
     let pid_path = crate::daemon::pid_file_path()?;
     match crate::daemon::read_pid(&pid_path)? {
-        Some(pid) if crate::daemon::alive(pid) => {
-            println!("daemon running (pid {pid}) — {}", pid_path.display());
-        }
-        Some(pid) => {
-            println!("stale pid file (pid {pid} not running) — {}", pid_path.display());
-        }
-        None => println!("daemon not running"),
+        Some(pid) if crate::daemon::alive(pid) => println!("running (pid {pid})"),
+        Some(pid) => println!("stale pid file (pid {pid} not running) — {}", pid_path.display()),
+        None => println!("not running"),
     }
     Ok(())
 }
@@ -196,16 +192,16 @@ pub fn status() -> Result<()> {
 pub fn stop() -> Result<()> {
     let pid_path = crate::daemon::pid_file_path()?;
     let Some(pid) = crate::daemon::read_pid(&pid_path)? else {
-        println!("no pid file — daemon probably not running");
+        println!("no pid file");
         return Ok(());
     };
     if !crate::daemon::alive(pid) {
-        println!("pid {pid} not running; removing stale pid file");
         let _ = std::fs::remove_file(&pid_path);
+        println!("pid {pid} not running; stale pid file removed");
         return Ok(());
     }
     crate::daemon::send_sigterm(pid)?;
-    println!("sent SIGTERM to pid {pid}");
+    println!("SIGTERM → pid {pid}");
     Ok(())
 }
 
@@ -216,13 +212,10 @@ pub fn reset(force: bool) -> Result<()> {
         crate::matrix::store_path()?,
         crate::names::default_store_path()?,
     ];
-
-    eprintln!("matrirc reset will remove:");
+    eprintln!("will remove:");
     for p in &paths {
         eprintln!("  {}", p.display());
     }
-    eprintln!();
-
     if !force {
         eprint!("proceed? [y/N] ");
         std::io::stderr().flush().ok();
@@ -233,32 +226,25 @@ pub fn reset(force: bool) -> Result<()> {
             return Ok(());
         }
     }
-
     for p in &paths {
         if p.is_dir() {
-            std::fs::remove_dir_all(p)
-                .with_context(|| format!("remove dir {}", p.display()))?;
-            println!("removed dir {}", p.display());
+            std::fs::remove_dir_all(p).with_context(|| p.display().to_string())?;
+            println!("removed {}", p.display());
         } else if p.exists() {
-            std::fs::remove_file(p)
-                .with_context(|| format!("remove {}", p.display()))?;
+            std::fs::remove_file(p).with_context(|| p.display().to_string())?;
             println!("removed {}", p.display());
         }
     }
-
-    println!("\nnext: Element → Sessions → sign out old matrirc device, then `matrirc login`.");
+    println!("next: Element → Sessions → sign out the old matrirc device, then `matrirc login`.");
     Ok(())
 }
 
 pub fn install_irssi(force: bool, dry_run: bool, bin: Option<PathBuf>) -> Result<()> {
-    let bin_str: String = match bin {
-        Some(p) => p
-            .to_str()
-            .ok_or_else(|| anyhow!("binary path is not valid UTF-8: {}", p.display()))?
-            .to_string(),
-        // Plain command name → let the user's $PATH resolve it at runtime.
-        // Survives matrirc being reinstalled, brew upgrades, etc.
-        None => "matrirc".to_string(),
+    // Bare `matrirc` resolves via $PATH at runtime, so the script survives
+    // brew upgrades or the binary moving.
+    let bin_str = match bin {
+        Some(p) => p.to_str().ok_or_else(|| anyhow!("non-utf8 path: {}", p.display()))?.to_owned(),
+        None => "matrirc".to_owned(),
     };
     let script = render_from_str(&bin_str)?;
 
@@ -268,37 +254,27 @@ pub fn install_irssi(force: bool, dry_run: bool, bin: Option<PathBuf>) -> Result
     }
 
     let (script_path, autorun_link) = irssi_paths()?;
-
     if script_path.exists() && !force {
-        return Err(anyhow!(
-            "{} already exists; pass --force to overwrite",
-            script_path.display()
-        ));
+        return Err(anyhow!("{} exists; use --force", script_path.display()));
     }
-    std::fs::create_dir_all(script_path.parent().unwrap())
-        .with_context(|| format!("create {}", script_path.parent().unwrap().display()))?;
-    std::fs::write(&script_path, script)
-        .with_context(|| format!("write {}", script_path.display()))?;
+    if let Some(d) = script_path.parent() {
+        std::fs::create_dir_all(d).context("create scripts dir")?;
+    }
+    std::fs::write(&script_path, script).context("write script")?;
     println!("installed {}", script_path.display());
 
-    std::fs::create_dir_all(autorun_link.parent().unwrap())
-        .with_context(|| format!("create {}", autorun_link.parent().unwrap().display()))?;
-    if autorun_link.exists() || autorun_link.symlink_metadata().is_ok() {
-        if force {
-            std::fs::remove_file(&autorun_link)
-                .with_context(|| format!("remove {}", autorun_link.display()))?;
-        } else {
-            return Err(anyhow!(
-                "{} already exists; pass --force to overwrite",
-                autorun_link.display()
-            ));
-        }
+    if let Some(d) = autorun_link.parent() {
+        std::fs::create_dir_all(d).context("create autorun dir")?;
     }
-    std::os::unix::fs::symlink("../matrirc.pl", &autorun_link)
-        .with_context(|| format!("symlink {}", autorun_link.display()))?;
-    println!("symlinked {} -> ../matrirc.pl", autorun_link.display());
-
-    println!("now: /script load matrirc  (or restart irssi)");
+    if autorun_link.symlink_metadata().is_ok() {
+        if !force {
+            return Err(anyhow!("{} exists; use --force", autorun_link.display()));
+        }
+        std::fs::remove_file(&autorun_link).context("remove autorun symlink")?;
+    }
+    std::os::unix::fs::symlink("../matrirc.pl", &autorun_link).context("symlink autorun")?;
+    println!("symlinked {} → ../matrirc.pl", autorun_link.display());
+    println!("now: /script load matrirc");
     Ok(())
 }
 

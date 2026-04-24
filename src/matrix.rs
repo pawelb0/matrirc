@@ -734,49 +734,34 @@ pub async fn login_with_password(
     mxid: &str,
     password: &str,
 ) -> Result<(Config, Client)> {
-    let store = store_path()?;
-    ensure_secret_dir(&store)?;
-    let client = Client::builder()
-        .homeserver_url(homeserver)
-        .sqlite_store(&store, None)
-        .build()
-        .await
-        .context("build matrix client")?;
-    let device_display = device_display_name();
+    let client = new_client(homeserver).await?;
     let resp = client
         .matrix_auth()
         .login_username(mxid, password)
-        .initial_device_display_name(&device_display)
+        .initial_device_display_name(&device_display_name())
         .send()
         .await
         .context("m.login.password")?;
-    let cfg = Config {
-        mxid: resp.user_id.to_string(),
-        homeserver_url: homeserver.trim_end_matches('/').to_string(),
-        access_token: resp.access_token,
-        device_id: resp.device_id.to_string(),
-    };
-    Ok((cfg, client))
+    Ok((
+        Config {
+            mxid: resp.user_id.to_string(),
+            homeserver_url: homeserver.trim_end_matches('/').to_string(),
+            access_token: resp.access_token,
+            device_id: resp.device_id.to_string(),
+        },
+        client,
+    ))
 }
 
-pub async fn login_with_token(
-    homeserver: &str,
-    mxid: &str,
-    token: &str,
-) -> Result<(Config, Client)> {
+pub async fn login_with_token(homeserver: &str, mxid: &str, token: &str) -> Result<(Config, Client)> {
     let http = reqwest::Client::builder()
         .user_agent(concat!("matrirc/", env!("CARGO_PKG_VERSION")))
         .build()?;
     let who = whoami(&http, homeserver, token).await?;
     if who.user_id != mxid {
-        return Err(anyhow!(
-            "token belongs to {} but you specified {mxid}",
-            who.user_id
-        ));
+        return Err(anyhow!("token belongs to {} not {mxid}", who.user_id));
     }
-    let device_id = who
-        .device_id
-        .ok_or_else(|| anyhow!("homeserver did not return a device_id; token may be guest"))?;
+    let device_id = who.device_id.ok_or_else(|| anyhow!("no device_id returned (guest token?)"))?;
     let cfg = Config {
         mxid: mxid.to_string(),
         homeserver_url: homeserver.trim_end_matches('/').to_string(),
@@ -788,19 +773,13 @@ pub async fn login_with_token(
 }
 
 fn device_display_name() -> String {
-    let host = hostname().unwrap_or_else(|| "unknown".to_string());
-    format!("matrirc ({host})")
-}
-
-fn hostname() -> Option<String> {
-    std::env::var("HOSTNAME").ok().or_else(|| {
-        std::process::Command::new("hostname")
-            .output()
-            .ok()
+    let host = std::env::var("HOSTNAME").ok()
+        .or_else(|| std::process::Command::new("hostname").output().ok()
             .and_then(|o| String::from_utf8(o.stdout).ok())
             .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-    })
+            .filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "unknown".into());
+    format!("matrirc ({host})")
 }
 
 /// Prints encryption posture + actionable hints. Does a couple of short extra
