@@ -6,7 +6,6 @@ use time::format_description::FormatItem;
 use time::macros::format_description;
 use time::OffsetDateTime;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::TcpStream;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
@@ -89,7 +88,7 @@ pub async fn handle(sock: TcpStream, peer: SocketAddr, bridge: Bridge) -> Result
 }
 
 async fn handle_matrix_event(
-    write: &mut OwnedWriteHalf,
+    write: &mut (impl tokio::io::AsyncWrite + Unpin),
     bridge: &Bridge,
     s: &mut State,
     ev: FromMatrix,
@@ -137,7 +136,7 @@ async fn handle_matrix_event(
 }
 
 async fn handle_command(
-    write: &mut OwnedWriteHalf,
+    write: &mut (impl tokio::io::AsyncWrite + Unpin),
     peer: &SocketAddr,
     bridge: &Bridge,
     msg: &Message,
@@ -173,7 +172,7 @@ async fn handle_command(
 }
 
 async fn handle_cap(
-    write: &mut OwnedWriteHalf,
+    write: &mut (impl tokio::io::AsyncWrite + Unpin),
     msg: &Message,
     caps_enabled: &mut HashSet<String>,
 ) -> Result<()> {
@@ -219,7 +218,7 @@ async fn handle_cap(
 }
 
 async fn handle_join(
-    write: &mut OwnedWriteHalf,
+    write: &mut (impl tokio::io::AsyncWrite + Unpin),
     nick: &str,
     msg: &Message,
     joined: &mut HashSet<String>,
@@ -258,7 +257,7 @@ fn is_matrix_alias(target: &str) -> bool {
 }
 
 async fn request_join_by_alias(
-    write: &mut OwnedWriteHalf,
+    write: &mut (impl tokio::io::AsyncWrite + Unpin),
     nick: &str,
     alias: &str,
     bridge: &Bridge,
@@ -284,7 +283,7 @@ async fn request_join_by_alias(
 }
 
 async fn join_echo(
-    write: &mut OwnedWriteHalf,
+    write: &mut (impl tokio::io::AsyncWrite + Unpin),
     nick: &str,
     joined: &mut HashSet<String>,
 ) -> Result<()> {
@@ -294,7 +293,7 @@ async fn join_echo(
 }
 
 async fn join_bridged(
-    write: &mut OwnedWriteHalf,
+    write: &mut (impl tokio::io::AsyncWrite + Unpin),
     nick: &str,
     chan: &str,
     room: &matrix_sdk::ruma::RoomId,
@@ -310,7 +309,7 @@ async fn join_bridged(
 }
 
 async fn send_join(
-    write: &mut OwnedWriteHalf,
+    write: &mut (impl tokio::io::AsyncWrite + Unpin),
     nick: &str,
     chan: &str,
     topic: &str,
@@ -327,7 +326,7 @@ async fn send_join(
 }
 
 async fn send_names(
-    write: &mut OwnedWriteHalf,
+    write: &mut (impl tokio::io::AsyncWrite + Unpin),
     nick: &str,
     chan: &str,
     members: &[&str],
@@ -368,7 +367,7 @@ async fn fetch_members(bridge: &Bridge, room: &matrix_sdk::ruma::RoomId) -> Vec<
 }
 
 async fn auto_join_all(
-    write: &mut OwnedWriteHalf,
+    write: &mut (impl tokio::io::AsyncWrite + Unpin),
     nick: &str,
     bridge: &Bridge,
     s: &mut State,
@@ -418,7 +417,7 @@ async fn auto_join_all(
     Ok(())
 }
 
-async fn bot_line(write: &mut OwnedWriteHalf, nick: &str, cmd: &str, body: &str) -> Result<()> {
+async fn bot_line(write: &mut (impl tokio::io::AsyncWrite + Unpin), nick: &str, cmd: &str, body: &str) -> Result<()> {
     send(
         write,
         Message::with_prefix(BOT_PREFIX, cmd, vec![nick.into(), body.into()]),
@@ -426,16 +425,16 @@ async fn bot_line(write: &mut OwnedWriteHalf, nick: &str, cmd: &str, body: &str)
     .await
 }
 
-async fn matrirc_notice(write: &mut OwnedWriteHalf, nick: &str, body: &str) -> Result<()> {
+async fn matrirc_notice(write: &mut (impl tokio::io::AsyncWrite + Unpin), nick: &str, body: &str) -> Result<()> {
     bot_line(write, nick, "NOTICE", body).await
 }
 
-async fn matrirc_msg(write: &mut OwnedWriteHalf, nick: &str, body: &str) -> Result<()> {
+async fn matrirc_msg(write: &mut (impl tokio::io::AsyncWrite + Unpin), nick: &str, body: &str) -> Result<()> {
     bot_line(write, nick, "PRIVMSG", body).await
 }
 
 async fn handle_bot_command(
-    write: &mut OwnedWriteHalf,
+    write: &mut (impl tokio::io::AsyncWrite + Unpin),
     nick: &str,
     text: &str,
     bridge: &Bridge,
@@ -533,7 +532,7 @@ async fn handle_bot_command(
 }
 
 async fn backfill_channel(
-    write: &mut OwnedWriteHalf,
+    write: &mut (impl tokio::io::AsyncWrite + Unpin),
     chan: &str,
     room: &matrix_sdk::ruma::RoomId,
     bridge: &Bridge,
@@ -594,7 +593,7 @@ fn ms_to_iso(ms: i64) -> Option<String> {
 }
 
 async fn handle_whois(
-    write: &mut OwnedWriteHalf,
+    write: &mut (impl tokio::io::AsyncWrite + Unpin),
     nick: &str,
     msg: &Message,
     bridge: &Bridge,
@@ -641,7 +640,7 @@ async fn handle_whois(
 
 #[allow(clippy::too_many_arguments)]
 async fn send_whois(
-    write: &mut OwnedWriteHalf,
+    write: &mut (impl tokio::io::AsyncWrite + Unpin),
     nick: &str,
     target_nick: &str,
     user: &str,
@@ -662,7 +661,7 @@ async fn send_whois(
 }
 
 async fn handle_part(
-    write: &mut OwnedWriteHalf,
+    write: &mut (impl tokio::io::AsyncWrite + Unpin),
     nick: &str,
     msg: &Message,
     joined: &mut HashSet<String>,
@@ -684,7 +683,7 @@ async fn handle_part(
 }
 
 async fn handle_privmsg(
-    write: &mut OwnedWriteHalf,
+    write: &mut (impl tokio::io::AsyncWrite + Unpin),
     nick: &str,
     msg: &Message,
     bridge: &Bridge,
@@ -752,7 +751,7 @@ fn strip_ctcp_action(text: &str) -> (&str, bool) {
         .unwrap_or((text, false))
 }
 
-async fn no_such(write: &mut OwnedWriteHalf, nick: &str, target: &str) -> Result<()> {
+async fn no_such(write: &mut (impl tokio::io::AsyncWrite + Unpin), nick: &str, target: &str) -> Result<()> {
     send(write, srv("401", vec![nick.into(), target.into(), "No such nick/channel".into()])).await
 }
 
@@ -767,7 +766,7 @@ async fn read_line<R: tokio::io::AsyncBufRead + Unpin>(
     Ok(Some(line))
 }
 
-async fn send_welcome(write: &mut OwnedWriteHalf, nick: &str) -> Result<()> {
+async fn send_welcome(write: &mut (impl tokio::io::AsyncWrite + Unpin), nick: &str) -> Result<()> {
     let n = nick.to_string();
     let lines: &[(&str, Vec<String>)] = &[
         ("001", vec![n.clone(), format!("Welcome to matrirc, {nick}")]),
@@ -790,10 +789,149 @@ fn srv(command: &str, params: Vec<String>) -> Message {
     Message::with_prefix(SERVER_NAME, command, params)
 }
 
-async fn send(write: &mut OwnedWriteHalf, msg: Message) -> Result<()> {
+async fn send(write: &mut (impl tokio::io::AsyncWrite + Unpin), msg: Message) -> Result<()> {
     let mut wire = msg.to_wire();
     debug!(out = %wire, "send");
     wire.push_str("\r\n");
     write.write_all(wire.as_bytes()).await.context("write")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bridge::{Mapping, FromMatrix};
+    use matrix_sdk::ruma::{OwnedRoomId, RoomId};
+
+    fn room(s: &str) -> OwnedRoomId {
+        RoomId::parse(s).unwrap()
+    }
+
+    fn registered_state(nick: &str) -> State {
+        State {
+            nick: Some(nick.into()),
+            user: Some(nick.into()),
+            registered: true,
+            ..State::default()
+        }
+    }
+
+    async fn drain(buf: Vec<u8>) -> String {
+        String::from_utf8(buf).unwrap()
+    }
+
+    async fn route(ev: FromMatrix, bridge: &Bridge, s: &mut State) -> String {
+        let mut out = Vec::<u8>::new();
+        handle_matrix_event(&mut out, bridge, s, ev).await.unwrap();
+        drain(out).await
+    }
+
+    #[tokio::test]
+    async fn channel_peer_message() {
+        let (b, _rx) = Bridge::new(Mapping::default());
+        let r = room("!a:server");
+        b.add_mapping(r.clone(), "#room-a".into(), "topic".into());
+        let mut s = registered_state("pawelb");
+        s.joined.insert("#room-a".into());
+        let out = route(
+            FromMatrix::Message { room: r, sender_nick: "alice".into(), body: "hi".into(), is_own: false },
+            &b, &mut s,
+        ).await;
+        assert_eq!(out, ":alice!alice@matrix PRIVMSG #room-a hi\r\n");
+    }
+
+    #[tokio::test]
+    async fn dm_peer_message_targets_own_nick() {
+        let (b, _rx) = Bridge::new(Mapping::default());
+        let r = room("!dm:server");
+        {
+            let mut m = b.mapping.write().unwrap();
+            m.insert_dm(r.clone(), "phobos", &[]);
+        }
+        let mut s = registered_state("pawelb");
+        let out = route(
+            FromMatrix::Message { room: r, sender_nick: "phobos".into(), body: "yo".into(), is_own: false },
+            &b, &mut s,
+        ).await;
+        assert_eq!(out, ":phobos!phobos@matrix PRIVMSG pawelb yo\r\n");
+    }
+
+    #[tokio::test]
+    async fn dm_own_message_routes_znc_style() {
+        let (b, _rx) = Bridge::new(Mapping::default());
+        let r = room("!dm:server");
+        {
+            let mut m = b.mapping.write().unwrap();
+            m.insert_dm(r.clone(), "phobos", &[]);
+        }
+        let mut s = registered_state("pawelb");
+        let out = route(
+            FromMatrix::Message { room: r, sender_nick: "pawelb".into(), body: "from other device".into(), is_own: true },
+            &b, &mut s,
+        ).await;
+        assert_eq!(out, ":pawelb!pawelb@matrirc.local PRIVMSG phobos :from other device\r\n");
+    }
+
+    #[tokio::test]
+    async fn unknown_room_is_dropped() {
+        let (b, _rx) = Bridge::new(Mapping::default());
+        let mut s = registered_state("pawelb");
+        let out = route(
+            FromMatrix::Message { room: room("!nope:server"), sender_nick: "alice".into(), body: "hi".into(), is_own: false },
+            &b, &mut s,
+        ).await;
+        assert!(out.is_empty(), "expected empty, got {out:?}");
+    }
+
+    #[tokio::test]
+    async fn channel_not_joined_is_dropped() {
+        let (b, _rx) = Bridge::new(Mapping::default());
+        let r = room("!a:server");
+        b.add_mapping(r.clone(), "#room-a".into(), "".into());
+        let mut s = registered_state("pawelb"); // no joined insert
+        let out = route(
+            FromMatrix::Message { room: r, sender_nick: "alice".into(), body: "hi".into(), is_own: false },
+            &b, &mut s,
+        ).await;
+        assert!(out.is_empty(), "expected empty, got {out:?}");
+    }
+
+    #[tokio::test]
+    async fn topic_changed_emits_topic() {
+        let (b, _rx) = Bridge::new(Mapping::default());
+        let mut s = registered_state("pawelb");
+        s.joined.insert("#room-a".into());
+        let out = route(
+            FromMatrix::TopicChanged { chan: "#room-a".into(), topic: "new topic".into() },
+            &b, &mut s,
+        ).await;
+        assert_eq!(out, ":matrirc.local TOPIC #room-a :new topic\r\n");
+    }
+
+    #[tokio::test]
+    async fn dm_added_emits_notice() {
+        let (b, _rx) = Bridge::new(Mapping::default());
+        let mut s = registered_state("pawelb");
+        let out = route(
+            FromMatrix::DmAdded { nick: "phobos".into() },
+            &b, &mut s,
+        ).await;
+        assert!(out.contains("NOTICE pawelb"), "{out}");
+        assert!(out.contains("phobos"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn multi_line_body_produces_multiple_privmsg() {
+        let (b, _rx) = Bridge::new(Mapping::default());
+        let r = room("!a:server");
+        b.add_mapping(r.clone(), "#room-a".into(), "".into());
+        let mut s = registered_state("pawelb");
+        s.joined.insert("#room-a".into());
+        let out = route(
+            FromMatrix::Message { room: r, sender_nick: "alice".into(), body: "one\ntwo".into(), is_own: false },
+            &b, &mut s,
+        ).await;
+        assert!(out.contains("PRIVMSG #room-a one\r\n"));
+        assert!(out.contains("PRIVMSG #room-a two\r\n"));
+    }
 }
