@@ -375,6 +375,24 @@ async fn fetch_members(client: &Client, room_id: &matrix_sdk::ruma::RoomId) -> V
         .collect()
 }
 
+async fn register_dm(client: &Client, bridge: &Bridge, room: &Room) {
+    let Some(nick) = dm_peer_nick(client, room).await else {
+        warn!(room = %room.room_id(), "DM has no identifiable peer");
+        return;
+    };
+    bridge.add_dm(room.room_id().to_owned(), nick);
+    // DMs skip backfill, so pull any server-side megolm keys in the background.
+    if matches!(room.encryption_state(), EncryptionState::Encrypted) {
+        let c = client.clone();
+        let rid = room.room_id().to_owned();
+        tokio::spawn(async move {
+            if let Err(e) = c.encryption().backups().download_room_keys_for_room(&rid).await {
+                tracing::debug!(%rid, "DM key download: {e}");
+            }
+        });
+    }
+}
+
 async fn dm_peer_nick(client: &Client, room: &Room) -> Option<String> {
     let me = client.user_id()?;
     let members = room
@@ -569,62 +587,21 @@ pub async fn run_sync(
         .context("initial sync")?;
 
     for room in client.rooms() {
-        let name = room
-            .display_name()
-            .await
-            .map(|n| n.to_string())
-            .unwrap_or_else(|_| "<no name>".to_string());
-        let state = room.state();
-        info!(
-            target: "matrirc::rooms",
-            room = %room.room_id(),
-            "{name} [{:?}]",
-            state
-        );
-
-        if !matches!(state, RoomState::Joined) {
-            continue;
-        }
-        if let Some(only) = &env_override_room {
-            if room.room_id() != only {
-                continue;
-            }
-        }
+        let name = room.display_name().await.map(|n| n.to_string()).unwrap_or_else(|_| "<no name>".into());
+        let rid = room.room_id();
+        info!(target: "matrirc::rooms", room = %rid, "{name} [{:?}]", room.state());
+        if !matches!(room.state(), RoomState::Joined) { continue; }
+        if env_override_room.as_deref().map(|o| o != rid).unwrap_or(false) { continue; }
 
         if room.is_direct().await.unwrap_or(false) {
-            match dm_peer_nick(&client, &room).await {
-                Some(nick) => {
-                    bridge.add_dm(room.room_id().to_owned(), nick);
-                    if matches!(room.encryption_state(), EncryptionState::Encrypted) {
-                        let c = client.clone();
-                        let rid = room.room_id().to_owned();
-                        tokio::spawn(async move {
-                            if let Err(e) = c
-                                .encryption()
-                                .backups()
-                                .download_room_keys_for_room(&rid)
-                                .await
-                            {
-                                tracing::debug!(room = %rid, "DM key download failed: {e}");
-                            }
-                        });
-                    }
-                }
-                None => warn!("DM room {} has no identifiable peer", room.room_id()),
-            }
+            register_dm(&client, &bridge, &room).await;
             continue;
         }
-
-        let preferred = preferred_channel_name(room.room_id(), Some(&name));
-        let chan = match name_store.assign_or_get(room.room_id(), &preferred) {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("name assign failed for {}: {e}", room.room_id());
-                continue;
-            }
-        };
-        let topic = room.topic().unwrap_or_else(|| name.clone());
-        bridge.add_mapping(room.room_id().to_owned(), chan, topic);
+        let preferred = preferred_channel_name(rid, Some(&name));
+        match name_store.assign_or_get(rid, &preferred) {
+            Ok(chan) => bridge.add_mapping(rid.to_owned(), chan, room.topic().unwrap_or_else(|| name.clone())),
+            Err(e) => warn!(%rid, "name assign: {e}"),
+        }
     }
 
     info!(
