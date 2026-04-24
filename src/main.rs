@@ -75,7 +75,8 @@ async fn run() -> Result<()> {
         }
     };
 
-    let serve = irc::serve("127.0.0.1:6667", bridge_state);
+    let bind = std::env::var("MATRIRC_BIND").unwrap_or_else(|_| "127.0.0.1:6667".into());
+    let serve = irc::serve(&bind, bridge_state);
     tokio::pin!(serve);
     let result = tokio::select! {
         r = &mut serve => r,
