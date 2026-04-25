@@ -1,6 +1,6 @@
 [package]
 name = "matrirc"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "Local IRC server that bridges to a Matrix homeserver"
 license = "GPL-3.0-or-later"
