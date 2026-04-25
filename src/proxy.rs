@@ -53,15 +53,21 @@ impl AttachIndex {
     }
 }
 
-pub async fn run_proxy(addr: SocketAddr, client: Client, index: Arc<AttachIndex>) -> Result<()> {
+pub async fn run_proxy(
+    addr: SocketAddr,
+    client: Client,
+    index: Arc<AttachIndex>,
+    bridge: crate::bridge::Bridge,
+) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
     info!("attach proxy listening on http://{addr}");
     loop {
         let (sock, _) = listener.accept().await?;
         let client = client.clone();
         let index = index.clone();
+        let bridge = bridge.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle(sock, client, index).await {
+            if let Err(e) = handle(sock, client, index, bridge).await {
                 debug!("proxy: {e:#}");
             }
         });
@@ -124,7 +130,12 @@ pub(crate) fn parse_upload_request(head: &str) -> Result<UploadRequest, &'static
     Ok(UploadRequest { scope, filename, caption, content_length })
 }
 
-async fn handle(mut sock: TcpStream, client: Client, index: Arc<AttachIndex>) -> Result<()> {
+async fn handle(
+    mut sock: TcpStream,
+    client: Client,
+    index: Arc<AttachIndex>,
+    _bridge: crate::bridge::Bridge,
+) -> Result<()> {
     let mut buf = vec![0u8; MAX_REQ_BYTES];
     let mut total = 0;
     loop {
