@@ -832,10 +832,16 @@ pub async fn report_encryption_state(client: &Client) {
     let verified = matches!(client.encryption().get_own_device().await, Ok(Some(d)) if d.is_verified());
     let backup_on_server = client.encryption().backups().are_enabled().await;
     let recovery_state = client.encryption().recovery().state();
+    let recovery_label = match recovery_state {
+        RecoveryState::Enabled => "enabled",
+        RecoveryState::Incomplete => "incomplete",
+        RecoveryState::Disabled => "disabled",
+        RecoveryState::Unknown => "unknown",
+    };
 
     println!("  device cross-signed:     {}", if verified { "yes" } else { "no" });
     println!("  server-side key backup:  {}", if backup_on_server { "exists" } else { "none" });
-    println!("  local recovery state:    {:?}", recovery_state);
+    println!("  local recovery state:    {recovery_label}");
     println!();
     match recovery_state {
         RecoveryState::Enabled => {
