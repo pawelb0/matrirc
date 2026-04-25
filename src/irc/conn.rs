@@ -279,18 +279,29 @@ async fn handle_cap(
                 SUPPORTED_CAPS.contains(c) || SUPPORTED_CAPS.contains(&c.trim_start_matches('-'))
             });
             let verb = if all_supported { "ACK" } else { "NAK" };
+            // server-time depends on message-tags per IRCv3 — irssi 1.4.5 only
+            // requests `server-time` and then can't parse the @time= prefix,
+            // so silently bundle message-tags into the ACK.
+            let mut ack_caps: Vec<String> = caps.iter().map(|c| (*c).to_string()).collect();
+            if all_supported
+                && caps.contains(&SERVER_TIME_CAP)
+                && !caps.contains(&MESSAGE_TAGS_CAP)
+            {
+                ack_caps.push(MESSAGE_TAGS_CAP.to_string());
+            }
             if all_supported {
-                for c in &caps {
+                for c in &ack_caps {
                     if let Some(removed) = c.strip_prefix('-') {
                         caps_enabled.remove(removed);
                     } else {
-                        caps_enabled.insert((*c).to_string());
+                        caps_enabled.insert(c.clone());
                     }
                 }
             }
+            let ack_payload = if all_supported { ack_caps.join(" ") } else { requested };
             send(
                 write,
-                srv("CAP", vec!["*".into(), verb.into(), requested]),
+                srv("CAP", vec!["*".into(), verb.into(), ack_payload]),
             )
             .await?;
         }
