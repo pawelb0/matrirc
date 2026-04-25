@@ -49,6 +49,14 @@ SIGTERMs the daemon on `/quit`.
 If you prefer not to autorun, skip `install-irssi` and just connect
 manually: `/connect 127.0.0.1 6667` from your IRC client of choice.
 
+For backfilled messages to render with their original send time,
+flip on irssi's server-time display (off by default in 1.4):
+
+```
+/set show_server_time on
+/save
+```
+
 ## Media
 
 Matrix attachments are gated behind authenticated media or E2EE
