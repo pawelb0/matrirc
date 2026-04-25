@@ -206,6 +206,7 @@ async fn send_to_mxid(
     mxid: &matrix_sdk::ruma::UserId,
     body: &str,
     emote: bool,
+    notice: bool,
 ) {
     let room = match find_or_create_dm(client, mxid).await {
         Ok(r) => r,
@@ -223,7 +224,7 @@ async fn send_to_mxid(
     let _ = bridge.from_matrix.send(FromMatrix::DmAdded { nick: nick.clone() });
     let localpart = mxid_localpart(mxid.as_str()).to_string();
     bridge.add_dm(rid.clone(), nick, &[mxid.as_str(), &localpart]);
-    send_to_room(client, bridge, &rid, body, emote).await;
+    send_to_room(client, bridge, &rid, body, emote, notice).await;
 }
 
 async fn find_or_create_dm(client: &Client, mxid: &matrix_sdk::ruma::UserId) -> Result<Room> {
@@ -247,6 +248,7 @@ async fn send_to_room(
     room_id: &matrix_sdk::ruma::RoomId,
     body: &str,
     emote: bool,
+    notice: bool,
 ) {
     let Some(room) = client.get_room(room_id) else {
         warn!("matrix room not found: {room_id}");
@@ -254,6 +256,8 @@ async fn send_to_room(
     };
     let content = if emote {
         RoomMessageEventContent::emote_plain(body)
+    } else if notice {
+        RoomMessageEventContent::notice_plain(body)
     } else {
         RoomMessageEventContent::text_plain(body)
     };
@@ -704,11 +708,11 @@ pub async fn run_sync(
     tokio::spawn(async move {
         while let Some(cmd) = to_matrix.recv().await {
             match cmd {
-                ToMatrix::Send { room, body, emote } => {
-                    send_to_room(&send_client, &send_bridge, &room, &body, emote).await;
+                ToMatrix::Send { room, body, emote, notice } => {
+                    send_to_room(&send_client, &send_bridge, &room, &body, emote, notice).await;
                 }
-                ToMatrix::SendToMxid { mxid, body, emote } => {
-                    send_to_mxid(&send_client, &send_bridge, &mxid, &body, emote).await;
+                ToMatrix::SendToMxid { mxid, body, emote, notice } => {
+                    send_to_mxid(&send_client, &send_bridge, &mxid, &body, emote, notice).await;
                 }
                 ToMatrix::Backfill { room, limit, reply } => {
                     let result = backfill(&send_client, &room, limit, &homeserver_for_sender).await;
@@ -731,6 +735,13 @@ pub async fn run_sync(
                 ToMatrix::SetDisplayName { name } => {
                     if let Err(e) = send_client.account().set_display_name(Some(&name)).await {
                         warn!("set display name: {e:#}");
+                    }
+                }
+                ToMatrix::SetTopic { room, topic } => {
+                    if let Some(r) = send_client.get_room(&room) {
+                        if let Err(e) = r.set_room_topic(&topic).await {
+                            warn!(%room, "set topic: {e:#}");
+                        }
                     }
                 }
             }

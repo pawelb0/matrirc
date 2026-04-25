@@ -82,11 +82,13 @@ pub enum ToMatrix {
         room: OwnedRoomId,
         body: String,
         emote: bool,
+        notice: bool,
     },
     SendToMxid {
         mxid: OwnedUserId,
         body: String,
         emote: bool,
+        notice: bool,
     },
     Backfill {
         room: OwnedRoomId,
@@ -112,6 +114,10 @@ pub enum ToMatrix {
     },
     SetDisplayName {
         name: String,
+    },
+    SetTopic {
+        room: OwnedRoomId,
+        topic: String,
     },
 }
 

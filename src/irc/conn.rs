@@ -25,6 +25,41 @@ const SERVER_NAME: &str = "matrirc.local";
 const VERSION: &str = concat!("matrirc-", env!("CARGO_PKG_VERSION"));
 const MAX_LINE: usize = 8192;
 
+// IRC numeric replies (RFC 1459 / RFC 2812 / modern IRCv3). Wire format is the
+// decimal string, so we keep them as `&str` to drop into `srv(...)` directly.
+mod rpl {
+    pub const WELCOME: &str = "001";
+    pub const YOURHOST: &str = "002";
+    pub const CREATED: &str = "003";
+    pub const MYINFO: &str = "004";
+    pub const ADMINME: &str = "256";
+    pub const ADMINLOC1: &str = "257";
+    pub const ADMINLOC2: &str = "258";
+    pub const ADMINEMAIL: &str = "259";
+    pub const WHOISUSER: &str = "311";
+    pub const WHOISSERVER: &str = "312";
+    pub const ENDOFWHO: &str = "315";
+    pub const ENDOFWHOIS: &str = "318";
+    pub const WHOISCHANNELS: &str = "319";
+    pub const LISTSTART: &str = "321";
+    pub const LIST: &str = "322";
+    pub const LISTEND: &str = "323";
+    pub const NOTOPIC: &str = "331";
+    pub const TOPIC: &str = "332";
+    pub const WHOREPLY: &str = "352";
+    pub const NAMREPLY: &str = "353";
+    pub const LINKS: &str = "364";
+    pub const ENDOFLINKS: &str = "365";
+    pub const ENDOFNAMES: &str = "366";
+    pub const INFO: &str = "371";
+    pub const MOTD: &str = "372";
+    pub const ENDOFINFO: &str = "374";
+    pub const MOTDSTART: &str = "375";
+    pub const ENDOFMOTD: &str = "376";
+    pub const ERR_NOSUCHNICK: &str = "401";
+    pub const ERR_NOSUCHCHANNEL: &str = "403";
+}
+
 const ECHO_NICK: &str = "echo";
 const ECHO_PREFIX: &str = "echo!echo@matrirc.local";
 const ECHO_CHAN: &str = "#echo";
@@ -170,7 +205,30 @@ async fn handle_command(
         "WHOIS" => if let Some(n) = s.nick.clone() {
             handle_whois(write, &n, msg, bridge).await?;
         },
-        "NOTICE" => {}
+        "TOPIC" => if let Some(n) = s.nick.clone() {
+            handle_topic(write, &n, msg, bridge).await?;
+        },
+        "LIST" => if let Some(n) = s.nick.clone() {
+            handle_list(write, &n, bridge).await?;
+        },
+        "NAMES" => if let Some(n) = s.nick.clone() {
+            handle_names(write, &n, msg, bridge).await?;
+        },
+        "WHO" => if let Some(n) = s.nick.clone() {
+            handle_who(write, &n, msg, bridge).await?;
+        },
+        "LINKS" => if let Some(n) = s.nick.clone() {
+            handle_links(write, &n).await?;
+        },
+        "ADMIN" => if let Some(n) = s.nick.clone() {
+            handle_admin(write, &n).await?;
+        },
+        "INFO" => if let Some(n) = s.nick.clone() {
+            handle_info(write, &n).await?;
+        },
+        "NOTICE" => if let Some(n) = s.nick.clone() {
+            handle_notice(write, &n, msg, bridge).await?;
+        },
         "QUIT" => {
             let _ = write.shutdown().await;
             info!(%peer, "client quit");
@@ -257,7 +315,7 @@ async fn handle_join(
             }
             continue;
         }
-        send(write, srv("403", vec![nick.into(), chan.into(), "No such channel".into()])).await?;
+        send(write, srv(rpl::ERR_NOSUCHCHANNEL, vec![nick.into(), chan.into(), "No such channel".into()])).await?;
     }
     Ok(())
 }
@@ -327,9 +385,9 @@ async fn send_join(
 ) -> Result<()> {
     send(write, Message::with_prefix(user_prefix(nick), "JOIN", vec![chan.into()])).await?;
     if topic.is_empty() {
-        send(write, srv("331", vec![nick.into(), chan.into(), "No topic is set".into()])).await?;
+        send(write, srv(rpl::NOTOPIC, vec![nick.into(), chan.into(), "No topic is set".into()])).await?;
     } else {
-        send(write, srv("332", vec![nick.into(), chan.into(), topic.into()])).await?;
+        send(write, srv(rpl::TOPIC, vec![nick.into(), chan.into(), topic.into()])).await?;
     }
     send_names(write, nick, chan, members).await?;
     Ok(())
@@ -350,7 +408,7 @@ async fn send_names(
     let mut line = String::new();
     for n in &names {
         if !line.is_empty() && line.len() + 1 + n.len() > BATCH_BYTES {
-            send(write, srv("353", vec![nick.into(), "=".into(), chan.into(), std::mem::take(&mut line)])).await?;
+            send(write, srv(rpl::NAMREPLY, vec![nick.into(), "=".into(), chan.into(), std::mem::take(&mut line)])).await?;
         }
         if !line.is_empty() {
             line.push(' ');
@@ -358,9 +416,9 @@ async fn send_names(
         line.push_str(n);
     }
     if !line.is_empty() {
-        send(write, srv("353", vec![nick.into(), "=".into(), chan.into(), line])).await?;
+        send(write, srv(rpl::NAMREPLY, vec![nick.into(), "=".into(), chan.into(), line])).await?;
     }
-    send(write, srv("366", vec![nick.into(), chan.into(), "End of /NAMES list".into()])).await?;
+    send(write, srv(rpl::ENDOFNAMES, vec![nick.into(), chan.into(), "End of /NAMES list".into()])).await?;
     Ok(())
 }
 
@@ -627,8 +685,8 @@ async fn handle_whois(
 
     let (tx, rx) = tokio::sync::oneshot::channel();
     if bridge.to_matrix.try_send(ToMatrix::Whois { nick: target.clone(), reply: tx }).is_err() {
-        send(write, srv("401", vec![nick.into(), target.clone(), "No such nick/channel".into()])).await?;
-        send(write, srv("318", vec![nick.into(), target, "End of /WHOIS list".into()])).await?;
+        send(write, srv(rpl::ERR_NOSUCHNICK, vec![nick.into(), target.clone(), "No such nick/channel".into()])).await?;
+        send(write, srv(rpl::ENDOFWHOIS, vec![nick.into(), target, "End of /WHOIS list".into()])).await?;
         return Ok(());
     }
     match rx.await.ok().flatten() {
@@ -641,8 +699,8 @@ async fn handle_whois(
             send_whois(write, nick, &info.nick, &info.nick, "matrix", &realname, server_hint, &info.rooms).await?;
         }
         None => {
-            send(write, srv("401", vec![nick.into(), target.clone(), "No such nick/channel".into()])).await?;
-            send(write, srv("318", vec![nick.into(), target, "End of /WHOIS list".into()])).await?;
+            send(write, srv(rpl::ERR_NOSUCHNICK, vec![nick.into(), target.clone(), "No such nick/channel".into()])).await?;
+            send(write, srv(rpl::ENDOFWHOIS, vec![nick.into(), target, "End of /WHOIS list".into()])).await?;
         }
     }
     Ok(())
@@ -659,14 +717,138 @@ async fn send_whois(
     server: Option<&str>,
     channels: &[String],
 ) -> Result<()> {
-    send(write, srv("311", vec![nick.into(), target_nick.into(), user.into(), host.into(), "*".into(), realname.into()])).await?;
+    send(write, srv(rpl::WHOISUSER, vec![nick.into(), target_nick.into(), user.into(), host.into(), "*".into(), realname.into()])).await?;
     if let Some(s) = server {
-        send(write, srv("312", vec![nick.into(), target_nick.into(), s.into(), "Matrix homeserver".into()])).await?;
+        send(write, srv(rpl::WHOISSERVER, vec![nick.into(), target_nick.into(), s.into(), "Matrix homeserver".into()])).await?;
     }
     if !channels.is_empty() {
-        send(write, srv("319", vec![nick.into(), target_nick.into(), channels.join(" ")])).await?;
+        send(write, srv(rpl::WHOISCHANNELS, vec![nick.into(), target_nick.into(), channels.join(" ")])).await?;
     }
-    send(write, srv("318", vec![nick.into(), target_nick.into(), "End of /WHOIS list".into()])).await?;
+    send(write, srv(rpl::ENDOFWHOIS, vec![nick.into(), target_nick.into(), "End of /WHOIS list".into()])).await?;
+    Ok(())
+}
+
+async fn handle_topic(
+    write: &mut (impl tokio::io::AsyncWrite + Unpin),
+    nick: &str,
+    msg: &Message,
+    bridge: &Bridge,
+) -> Result<()> {
+    let Some(chan) = msg.params.first() else { return Ok(()); };
+    let Some(room) = bridge.room_for(chan) else {
+        return send(write, srv(rpl::ERR_NOSUCHCHANNEL, vec![nick.into(), chan.into(), "No such channel".into()])).await;
+    };
+    match msg.params.get(1) {
+        Some(topic) => {
+            let _ = bridge.to_matrix.try_send(ToMatrix::SetTopic { room, topic: topic.clone() });
+        }
+        None => {
+            let topic = bridge.topic_for(chan).unwrap_or_default();
+            let code = if topic.is_empty() { "331" } else { "332" };
+            send(write, srv(code, vec![nick.into(), chan.into(), topic])).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn handle_list(
+    write: &mut (impl tokio::io::AsyncWrite + Unpin),
+    nick: &str,
+    bridge: &Bridge,
+) -> Result<()> {
+    send(write, srv(rpl::LISTSTART, vec![nick.into(), "Channel".into(), "Users  Name".into()])).await?;
+    for (chan, _) in bridge.snapshot() {
+        let topic = bridge.topic_for(&chan).unwrap_or_default();
+        send(write, srv(rpl::LIST, vec![nick.into(), chan, "0".into(), topic])).await?;
+    }
+    send(write, srv(rpl::LISTEND, vec![nick.into(), "End of /LIST".into()])).await
+}
+
+async fn handle_names(
+    write: &mut (impl tokio::io::AsyncWrite + Unpin),
+    nick: &str,
+    msg: &Message,
+    bridge: &Bridge,
+) -> Result<()> {
+    let Some(chan) = msg.params.first() else { return Ok(()); };
+    let members = match bridge.room_for(chan) {
+        Some(r) => fetch_members(bridge, &r).await,
+        None => Vec::new(),
+    };
+    let mut line = String::new();
+    for m in &members {
+        if line.len() + m.len() + 1 > 400 {
+            send(write, srv(rpl::NAMREPLY, vec![nick.into(), "=".into(), chan.into(), std::mem::take(&mut line)])).await?;
+        }
+        if !line.is_empty() { line.push(' '); }
+        line.push_str(m);
+    }
+    if !line.is_empty() {
+        send(write, srv(rpl::NAMREPLY, vec![nick.into(), "=".into(), chan.into(), line])).await?;
+    }
+    send(write, srv(rpl::ENDOFNAMES, vec![nick.into(), chan.into(), "End of /NAMES list".into()])).await
+}
+
+async fn handle_who(
+    write: &mut (impl tokio::io::AsyncWrite + Unpin),
+    nick: &str,
+    msg: &Message,
+    bridge: &Bridge,
+) -> Result<()> {
+    let Some(target) = msg.params.first() else { return Ok(()); };
+    let members = match bridge.room_for(target) {
+        Some(r) => fetch_members(bridge, &r).await,
+        None => Vec::new(),
+    };
+    for m in &members {
+        send(write, srv(rpl::WHOREPLY, vec![
+            nick.into(), target.into(), m.into(), "matrix".into(),
+            SERVER_NAME.into(), m.into(), "H".into(), format!("0 {m}"),
+        ])).await?;
+    }
+    send(write, srv(rpl::ENDOFWHO, vec![nick.into(), target.into(), "End of /WHO list".into()])).await
+}
+
+
+async fn handle_links(write: &mut (impl tokio::io::AsyncWrite + Unpin), nick: &str) -> Result<()> {
+    send(write, srv(rpl::LINKS, vec![nick.into(), SERVER_NAME.into(), SERVER_NAME.into(), format!("0 {VERSION}")])).await?;
+    send(write, srv(rpl::ENDOFLINKS, vec![nick.into(), "*".into(), "End of /LINKS list".into()])).await
+}
+
+async fn handle_admin(write: &mut (impl tokio::io::AsyncWrite + Unpin), nick: &str) -> Result<()> {
+    for (code, line) in [
+        (rpl::ADMINME, format!("Administrative info about {SERVER_NAME}")),
+        (rpl::ADMINLOC1, "matrirc — local Matrix↔IRC bridge".into()),
+        (rpl::ADMINLOC2, "https://github.com/pawelb0/matrirc".into()),
+        (rpl::ADMINEMAIL, "issues: github.com/pawelb0/matrirc/issues".into()),
+    ] {
+        send(write, srv(code, vec![nick.into(), line])).await?;
+    }
+    Ok(())
+}
+
+async fn handle_info(write: &mut (impl tokio::io::AsyncWrite + Unpin), nick: &str) -> Result<()> {
+    for line in [
+        format!("{VERSION} — local Matrix↔IRC bridge"),
+        "https://github.com/pawelb0/matrirc".into(),
+    ] {
+        send(write, srv(rpl::INFO, vec![nick.into(), line])).await?;
+    }
+    send(write, srv(rpl::ENDOFINFO, vec![nick.into(), "End of /INFO list".into()])).await
+}
+
+async fn handle_notice(
+    write: &mut (impl tokio::io::AsyncWrite + Unpin),
+    nick: &str,
+    msg: &Message,
+    bridge: &Bridge,
+) -> Result<()> {
+    let Some(target) = msg.params.first() else { return Ok(()); };
+    let Some(body) = msg.params.get(1) else { return Ok(()); };
+    let Some(dest) = resolve_send_target(target, bridge) else {
+        return no_such(write, nick, target).await;
+    };
+    let _ = bridge.to_matrix.try_send(make_send_cmd(dest, body.clone(), false, true));
     Ok(())
 }
 
@@ -710,6 +892,9 @@ async fn handle_privmsg(
     }
     if target.eq_ignore_ascii_case("matrirc") {
         if emote { return Ok(()); }
+        if let Some(reply) = ctcp_reply_for(body) {
+            return send(write, Message::with_prefix(BOT_PREFIX, "NOTICE", vec![nick.into(), format!("\x01{reply}\x01")])).await;
+        }
         return handle_bot_command(write, nick, body, bridge).await;
     }
 
@@ -721,13 +906,11 @@ async fn handle_privmsg(
         send(write, Message::with_prefix(&source, "PRIVMSG", vec![target.clone(), wire_body])).await?;
     }
 
-    let body = body.to_string();
-    let cmd = if let Some(room) = bridge.room_for(target) {
-        ToMatrix::Send { room, body, emote }
-    } else if let Some(room) = bridge.dm_room_for(target) {
-        // Non-canonical alias? Hint the canonical nick so the user knows where
-        // replies will land (the canonical window was pre-opened on register).
-        if let Some(canon) = bridge.dm_nick_for(&room) {
+    let Some(dest) = resolve_send_target(target, bridge) else {
+        return no_such(write, nick, target).await;
+    };
+    if let SendTarget::Room(ref room) = dest {
+        if let Some(canon) = bridge.dm_nick_for(room) {
             if !target.eq_ignore_ascii_case(&canon) && s.dm_hinted.insert(room.clone()) {
                 matrirc_notice(
                     write, nick,
@@ -735,23 +918,33 @@ async fn handle_privmsg(
                 ).await?;
             }
         }
-        ToMatrix::Send { room, body, emote }
-    } else if target.contains(':') {
-        // irssi strips leading '@' in /query; accept both forms.
-        let canonical = if target.starts_with('@') { target.into() } else { format!("@{target}") };
-        match matrix_sdk::ruma::OwnedUserId::try_from(canonical.as_str()) {
-            Ok(mxid) => ToMatrix::SendToMxid { mxid, body, emote },
-            Err(_) => return no_such(write, nick, target).await,
-        }
-    } else {
-        return no_such(write, nick, target).await;
-    };
-
+    }
+    let cmd = make_send_cmd(dest, body.to_string(), emote, false);
     if let Err(e) = bridge.to_matrix.try_send(cmd) {
         warn!("dropping outbound: {e}");
         send(write, srv("NOTICE", vec![nick.into(), format!("send dropped: {e}")])).await?;
     }
     Ok(())
+}
+
+enum SendTarget {
+    Room(matrix_sdk::ruma::OwnedRoomId),
+    Mxid(matrix_sdk::ruma::OwnedUserId),
+}
+
+fn resolve_send_target(target: &str, bridge: &Bridge) -> Option<SendTarget> {
+    if let Some(r) = bridge.room_for(target) { return Some(SendTarget::Room(r)); }
+    if let Some(r) = bridge.dm_room_for(target) { return Some(SendTarget::Room(r)); }
+    if !target.contains(':') { return None; }
+    let canonical = if target.starts_with('@') { target.into() } else { format!("@{target}") };
+    matrix_sdk::ruma::OwnedUserId::try_from(canonical.as_str()).ok().map(SendTarget::Mxid)
+}
+
+fn make_send_cmd(dest: SendTarget, body: String, emote: bool, notice: bool) -> ToMatrix {
+    match dest {
+        SendTarget::Room(room) => ToMatrix::Send { room, body, emote, notice },
+        SendTarget::Mxid(mxid) => ToMatrix::SendToMxid { mxid, body, emote, notice },
+    }
 }
 
 fn strip_ctcp_action(text: &str) -> (&str, bool) {
@@ -761,8 +954,19 @@ fn strip_ctcp_action(text: &str) -> (&str, bool) {
         .unwrap_or((text, false))
 }
 
+fn ctcp_reply_for(body: &str) -> Option<String> {
+    let inner = body.strip_prefix('\x01')?.strip_suffix('\x01')?;
+    let cmd = inner.split_whitespace().next()?.to_ascii_uppercase();
+    match cmd.as_str() {
+        "VERSION" => Some(format!("VERSION {VERSION}")),
+        "PING" => Some(inner.to_string()),
+        "TIME" => OffsetDateTime::now_utc().format(ISO_FMT).ok().map(|t| format!("TIME {t}")),
+        _ => None,
+    }
+}
+
 async fn no_such(write: &mut (impl tokio::io::AsyncWrite + Unpin), nick: &str, target: &str) -> Result<()> {
-    send(write, srv("401", vec![nick.into(), target.into(), "No such nick/channel".into()])).await
+    send(write, srv(rpl::ERR_NOSUCHNICK, vec![nick.into(), target.into(), "No such nick/channel".into()])).await
 }
 
 async fn read_line<R: tokio::io::AsyncBufRead + Unpin>(
@@ -779,15 +983,15 @@ async fn read_line<R: tokio::io::AsyncBufRead + Unpin>(
 async fn send_welcome(write: &mut (impl tokio::io::AsyncWrite + Unpin), nick: &str) -> Result<()> {
     let n = nick.to_string();
     let lines: &[(&str, Vec<String>)] = &[
-        ("001", vec![n.clone(), format!("Welcome to matrirc, {nick}")]),
-        ("002", vec![n.clone(), format!("Your host is {SERVER_NAME}, running {VERSION}")]),
-        ("003", vec![n.clone(), "This server has no creation date".into()]),
-        ("004", vec![n.clone(), SERVER_NAME.into(), VERSION.into(), String::new(), String::new()]),
-        ("375", vec![n.clone(), format!("- {SERVER_NAME} Message of the day -")]),
-        ("372", vec![n.clone(), "- Matrix rooms auto-joined after this line.".into()]),
-        ("372", vec![n.clone(), "- /msg matrirc help  for bridge commands.".into()]),
-        ("372", vec![n.clone(), format!("- /join {ECHO_CHAN}  for a local echo channel.")]),
-        ("376", vec![n, "End of /MOTD command.".into()]),
+        (rpl::WELCOME, vec![n.clone(), format!("Welcome to matrirc, {nick}")]),
+        (rpl::YOURHOST, vec![n.clone(), format!("Your host is {SERVER_NAME}, running {VERSION}")]),
+        (rpl::CREATED, vec![n.clone(), "This server has no creation date".into()]),
+        (rpl::MYINFO, vec![n.clone(), SERVER_NAME.into(), VERSION.into(), String::new(), String::new()]),
+        (rpl::MOTDSTART, vec![n.clone(), format!("- {SERVER_NAME} Message of the day -")]),
+        (rpl::MOTD, vec![n.clone(), "- Matrix rooms auto-joined after this line.".into()]),
+        (rpl::MOTD, vec![n.clone(), "- /msg matrirc help  for bridge commands.".into()]),
+        (rpl::MOTD, vec![n.clone(), format!("- /join {ECHO_CHAN}  for a local echo channel.")]),
+        (rpl::ENDOFMOTD, vec![n, "End of /MOTD command.".into()]),
     ];
     for (code, params) in lines {
         send(write, srv(code, params.clone())).await?;
