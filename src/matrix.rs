@@ -57,16 +57,12 @@ pub fn server_name_from_mxid(mxid: &str) -> Result<&str> {
 }
 
 pub async fn discover_homeserver(http: &reqwest::Client, server_name: &str) -> Result<String> {
-    let url = format!("https://{server_name}/.well-known/matrix/client");
-    let resp = http.get(&url).send().await;
-    if let Ok(r) = resp {
-        if r.status().is_success() {
-            if let Ok(wk) = r.json::<WellKnown>().await {
-                return Ok(wk.homeserver.base_url.trim_end_matches('/').to_string());
-            }
-        }
-    }
-    Ok(format!("https://{server_name}"))
+    let fallback = format!("https://{server_name}");
+    let url = format!("{fallback}/.well-known/matrix/client");
+    let Ok(resp) = http.get(&url).send().await else { return Ok(fallback); };
+    if !resp.status().is_success() { return Ok(fallback); }
+    let Ok(wk) = resp.json::<WellKnown>().await else { return Ok(fallback); };
+    Ok(wk.homeserver.base_url.trim_end_matches('/').to_string())
 }
 
 /// IRC mIRC colour codes. 14 = grey, 5 = red, 15 = silver. Reset with \x0f.
