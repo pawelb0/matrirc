@@ -80,10 +80,11 @@ pub async fn login(
     };
 
     let (cfg, client) = if use_token {
-        let token = read_secret("MATRIRC_TOKEN", "token")?;
+        let token = read_secret("MATRIRC_TOKEN", "token", None)?;
         matrix::login_with_token(&homeserver_url, mxid, &token).await?
     } else {
-        let password = read_password_for_mxid(mxid)?;
+        let prompt = format!("password for {mxid}: ");
+        let password = read_secret("MATRIRC_PASSWORD", "password", Some(&prompt))?;
         matrix::login_with_password(&homeserver_url, mxid, &password).await?
     };
 
@@ -109,51 +110,33 @@ pub async fn login(
     Ok(())
 }
 
-fn read_password_for_mxid(mxid: &str) -> Result<String> {
-    if let Ok(p) = std::env::var("MATRIRC_PASSWORD") {
-        let p = p.trim().to_string();
-        if !p.is_empty() {
-            return Ok(p);
-        }
-    }
-    use std::io::IsTerminal;
-    if !std::io::stdin().is_terminal() {
-        let mut buf = String::new();
-        std::io::stdin().read_to_string(&mut buf).context("read stdin")?;
-        let p = buf.trim().to_string();
-        if p.is_empty() {
-            return Err(anyhow!("empty password on stdin"));
-        }
-        return Ok(p);
-    }
-    let prompt = format!("password for {mxid}: ");
-    rpassword::prompt_password(prompt).context("prompt password")
-}
-
 pub fn read_recovery_key() -> Result<String> {
-    read_secret("MATRIRC_RECOVERY_KEY", "recovery key")
+    read_secret("MATRIRC_RECOVERY_KEY", "recovery key", None)
 }
 
-fn read_secret(env: &str, label: &str) -> Result<String> {
-    if let Ok(t) = std::env::var(env) {
-        let t = t.trim().to_string();
-        if !t.is_empty() {
-            return Ok(t);
+/// Reads a secret from `$env`, then stdin (if piped), then `tty_prompt`
+/// (rpassword) when stdin is a TTY and a prompt was given.
+fn read_secret(env: &str, label: &str, tty_prompt: Option<&str>) -> Result<String> {
+    if let Ok(v) = std::env::var(env) {
+        let v = v.trim();
+        if !v.is_empty() {
+            return Ok(v.to_string());
         }
     }
     use std::io::IsTerminal;
     if std::io::stdin().is_terminal() {
-        return Err(anyhow!(
-            "no {label}: set {env} or pipe the {label} on stdin"
-        ));
+        let Some(prompt) = tty_prompt else {
+            return Err(anyhow!("no {label}: set {env} or pipe the {label} on stdin"));
+        };
+        return rpassword::prompt_password(prompt).context("prompt password");
     }
     let mut buf = String::new();
     std::io::stdin().read_to_string(&mut buf).context("read stdin")?;
-    let t = buf.trim().to_string();
-    if t.is_empty() {
+    let v = buf.trim();
+    if v.is_empty() {
         return Err(anyhow!("empty {label} on stdin"));
     }
-    Ok(t)
+    Ok(v.to_string())
 }
 
 pub async fn verify() -> Result<()> {
