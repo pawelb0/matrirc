@@ -225,11 +225,13 @@ pub fn reset(force: bool) -> Result<()> {
 pub fn install_irssi(force: bool, dry_run: bool, bin: Option<PathBuf>) -> Result<()> {
     // Bare `matrirc` resolves via $PATH at runtime, so the script survives
     // brew upgrades or the binary moving.
-    let bin_str = match bin {
-        Some(p) => p.to_str().ok_or_else(|| anyhow!("non-utf8 path: {}", p.display()))?.to_owned(),
-        None => "matrirc".to_owned(),
+    let script = match bin {
+        Some(p) => {
+            let s = p.to_str().ok_or_else(|| anyhow!("non-utf8 path: {}", p.display()))?;
+            render_from_str(s)?
+        }
+        None => render_from_str("matrirc")?,
     };
-    let script = render_from_str(&bin_str)?;
 
     if dry_run {
         print!("{script}");
