@@ -123,10 +123,17 @@ sub pick {
     return undef;
 }
 
+my @MONTHS = qw(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec);
+
 sub fmt_time {
     my $t = shift // 0;
     my @lt = localtime $t;
-    return sprintf("%02d:%02d", $lt[2], $lt[1]);
+    my @today = localtime;
+    my $today =
+        $lt[5] == $today[5] && $lt[4] == $today[4] && $lt[3] == $today[3];
+    return $today
+        ? sprintf("%02d:%02d", $lt[2], $lt[1])
+        : sprintf("%s %02d %02d:%02d", $MONTHS[$lt[4]], $lt[3], $lt[2], $lt[1]);
 }
 
 sub parse_iso {
@@ -274,7 +281,7 @@ sub cmd_medialist {
     Irssi::print("matrirc media ($scope, most recent first):");
     for my $i (0 .. $#list) {
         my $r = $list[$i];
-        Irssi::print(sprintf("  %2d. %s [%s] %-12s %-25s %s",
+        Irssi::print(sprintf("  %2d. %-12s [%s] %-12s %-25s %s",
             $i + 1,
             fmt_time($r->{time}),
             $r->{kind},
