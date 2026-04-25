@@ -666,8 +666,14 @@ pub async fn run_sync(
     {
         let proxy_client = client.clone();
         let proxy_index = attach_index.clone();
+        let proxy_bridge = bridge.clone();
         tokio::spawn(async move {
-            if let Err(e) = crate::proxy::run_proxy(attach_addr, proxy_client, proxy_index).await {
+            if let Err(e) = crate::proxy::run_proxy(
+                attach_addr,
+                proxy_client,
+                proxy_index,
+                proxy_bridge,
+            ).await {
                 warn!("attach proxy stopped: {e:#}");
             }
         });
