@@ -3,7 +3,7 @@ use warnings;
 use Irssi;
 use vars qw($VERSION %IRSSI);
 
-$VERSION = '0.4.0';
+$VERSION = '0.5.0';
 %IRSSI = (
     authors     => 'matrirc',
     name        => 'matrirc-media',
@@ -92,22 +92,37 @@ sub on_privmsg_event {
         kind    => $kind,
         target  => $lookup,
         servtag => $server->{tag},
+        time    => time,
     };
     track($info);
     my $tag = length($name) ? " — $name" : '';
     print_to_origin($info, "↳ $kind #1 from $nick$tag  (/mediashow [N|name])");
 }
 
+sub recent_in {
+    my ($witem) = @_;
+    my $name = $witem ? ($witem->{name} // '') : '';
+    return @recent unless length $name;
+    return grep { ($_->{target} // '') eq $name } @recent;
+}
+
 sub pick {
-    my ($spec) = @_;
+    my ($spec, $witem) = @_;
     $spec //= '';
-    return $recent[0] if $spec eq '';
-    return $recent[int($spec) - 1] if $spec =~ /^\d+$/;
+    my @list = recent_in($witem);
+    return $list[0] if $spec eq '';
+    return $list[int($spec) - 1] if $spec =~ /^\d+$/;
     my $needle = lc $spec;
-    for my $r (@recent) {
+    for my $r (@list) {
         return $r if lc($r->{name} // '') =~ /\Q$needle\E/;
     }
     return undef;
+}
+
+sub fmt_time {
+    my $t = shift // 0;
+    my @lt = localtime $t;
+    return sprintf("%02d:%02d", $lt[2], $lt[1]);
 }
 
 # Async-fetch the picked attachment to a final filesystem path. After fetch,
@@ -185,7 +200,7 @@ Irssi::signal_add('pidwait' => sub {
 sub cmd_mediashow {
     my ($args, $server, $witem) = @_;
     $args =~ s/^\s+|\s+$//g;
-    my $info = pick($args);
+    my $info = pick($args, $witem);
     if (!$info) {
         Irssi::print("mediashow: no match (history: " . scalar(@recent) . ")");
         return;
@@ -216,7 +231,7 @@ sub cmd_mediasave {
     my $spec = $parts[0] // '';
     my $dest_dir = $parts[1] // $SAVE_DIR;
     $dest_dir =~ s{^~}{$ENV{HOME}};
-    my $info = pick($spec);
+    my $info = pick($spec, $witem);
     if (!$info) {
         Irssi::print("mediasave: no match (history: " . scalar(@recent) . ")");
         return;
@@ -234,15 +249,21 @@ sub cmd_mediasave {
 }
 
 sub cmd_medialist {
-    if (!@recent) {
-        Irssi::print("mediashow: history is empty");
+    my ($args, $server, $witem) = @_;
+    my $all = (defined $args && $args =~ /\ball\b/i);
+    my @list = $all ? @recent : recent_in($witem);
+    if (!@list) {
+        Irssi::print("medialist: nothing here yet");
         return;
     }
-    Irssi::print("matrirc media history (most recent first):");
-    for my $i (0 .. $#recent) {
-        my $r = $recent[$i];
-        Irssi::print(sprintf("  %2d. [%s] %-12s %-25s %s",
+    my $scope = $all ? 'all channels'
+              : ($witem && $witem->{name}) ? "in $witem->{name}" : 'all channels';
+    Irssi::print("matrirc media ($scope, most recent first):");
+    for my $i (0 .. $#list) {
+        my $r = $list[$i];
+        Irssi::print(sprintf("  %2d. %s [%s] %-12s %-25s %s",
             $i + 1,
+            fmt_time($r->{time}),
             $r->{kind},
             $r->{nick},
             $r->{target},
