@@ -49,6 +49,24 @@ SIGTERMs the daemon on `/quit`.
 If you prefer not to autorun, skip `install-irssi` and just connect
 manually: `/connect 127.0.0.1 6667` from your IRC client of choice.
 
+## Media
+
+Matrix attachments are gated behind authenticated media or E2EE
+keys — IRC clients can't fetch them directly. Matrirc binds a
+second listener on `127.0.0.1:6680` and rewrites image/file/audio/
+video msgtypes to `<http://127.0.0.1:6680/attach/<event_id>>`. The
+proxy looks up the indexed `MediaSource`, downloads via the
+authenticated client, decrypts E2EE blobs, returns plaintext.
+
+Setup:
+
+```
+matrirc install-irssi --media
+# restart irssi (or /script load matrirc-media)
+```
+
+Then `/mediashow [N|name]`, `/mediasave [N|name]`, `/medialist`.
+
 ## Commands
 
 ```
