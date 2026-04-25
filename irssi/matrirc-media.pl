@@ -112,8 +112,15 @@ sub recent_in {
 
 sub pick {
     my ($spec, $witem) = @_;
+    return pick_in(scalar recent_in($witem), $spec);
+}
+
+sub pick_in {
+    my ($list_or_scope, $spec) = @_;
     $spec //= '';
-    my @list = recent_in($witem);
+    my @list = ref($list_or_scope) eq 'ARRAY'
+        ? @$list_or_scope
+        : grep { ($_->{target} // '') eq $list_or_scope } @recent;
     return $list[0] if $spec eq '';
     return $list[int($spec) - 1] if $spec =~ /^\d+$/;
     my $needle = lc $spec;
@@ -121,6 +128,21 @@ sub pick {
         return $r if lc($r->{name} // '') =~ /\Q$needle\E/;
     }
     return undef;
+}
+
+# Returns ($scope, $remaining_args) — first arg starting with # & ! + is
+# treated as an explicit channel scope; otherwise scope is the current
+# window's name (or undef for non-window contexts).
+sub scope_from_args {
+    my ($args, $witem) = @_;
+    $args //= '';
+    $args =~ s/^\s+|\s+$//g;
+    my @parts = split /\s+/, $args, 2;
+    if (@parts && $parts[0] =~ /^[#&!+]/) {
+        return ($parts[0], $parts[1] // '');
+    }
+    my $name = $witem ? ($witem->{name} // '') : '';
+    return (length $name ? $name : undef, $args);
 }
 
 my @MONTHS = qw(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec);
@@ -219,14 +241,14 @@ Irssi::signal_add('pidwait' => sub {
 
 sub cmd_mediashow {
     my ($args, $server, $witem) = @_;
-    if (!$witem || !$witem->{name}) {
-        Irssi::print("mediashow: run from a channel or query window");
+    my ($scope, $spec) = scope_from_args($args, $witem);
+    if (!defined $scope) {
+        Irssi::print("mediashow: usage: /mediashow [#channel] [N|name]");
         return;
     }
-    $args =~ s/^\s+|\s+$//g;
-    my $info = pick($args, $witem);
+    my $info = pick_in($scope, $spec);
     if (!$info) {
-        Irssi::print("mediashow: no match in $witem->{name}");
+        Irssi::print("mediashow: no match in $scope");
         return;
     }
     fetch_async(
@@ -251,17 +273,18 @@ sub cmd_mediashow {
 
 sub cmd_mediasave {
     my ($args, $server, $witem) = @_;
-    if (!$witem || !$witem->{name}) {
-        Irssi::print("mediasave: run from a channel or query window");
+    my ($scope, $rest) = scope_from_args($args, $witem);
+    if (!defined $scope) {
+        Irssi::print("mediasave: usage: /mediasave [#channel] [N|name] [dir]");
         return;
     }
-    my @parts = split /\s+/, ($args // ''), 2;
-    my $spec = $parts[0] // '';
-    my $dest_dir = $parts[1] // $SAVE_DIR;
+    my @p = split /\s+/, $rest, 2;
+    my $spec = $p[0] // '';
+    my $dest_dir = $p[1] // $SAVE_DIR;
     $dest_dir =~ s{^~}{$ENV{HOME}};
-    my $info = pick($spec, $witem);
+    my $info = pick_in($scope, $spec);
     if (!$info) {
-        Irssi::print("mediasave: no match in $witem->{name}");
+        Irssi::print("mediasave: no match in $scope");
         return;
     }
     fetch_async(
