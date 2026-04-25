@@ -7,6 +7,7 @@ use matrix_sdk::config::SyncSettings;
 use matrix_sdk::room::MessagesOptions;
 use matrix_sdk::ruma::events::reaction::SyncReactionEvent;
 use matrix_sdk::ruma::events::room::encrypted::SyncRoomEncryptedEvent;
+use matrix_sdk::ruma::events::room::member::{MembershipChange, SyncRoomMemberEvent};
 use matrix_sdk::ruma::events::room::message::{
     MessageType, Relation, RoomMessageEventContent, SyncRoomMessageEvent,
 };
@@ -676,6 +677,38 @@ pub async fn run_sync(
                 let Some((nick, is_own)) = accept_event(&bridge, &room, &orig.event_id, &orig.sender, &own).await else { return; };
                 emit_message(&bridge, room.room_id(), nick,
                     format!("{C_RED}[encrypted — run `matrirc bootstrap-e2ee` once to decrypt]{C_RESET}"), is_own);
+            }
+        });
+    }
+
+    {
+        let bridge = bridge.clone();
+        let own = own_id.clone();
+        client.add_event_handler(move |ev: SyncRoomMemberEvent, room: Room| {
+            let bridge = bridge.clone();
+            let own = own.clone();
+            async move {
+                let Some(orig) = ev.as_original() else { return; };
+                if orig.state_key == own { return; }
+                let Some(chan) = bridge.chan_for(room.room_id()) else { return; };
+                let nick = match orig.content.displayname.as_deref() {
+                    Some(d) => sanitize_nick(d),
+                    None => mxid_localpart(orig.state_key.as_str()).to_string(),
+                };
+                let event = match orig.membership_change() {
+                    MembershipChange::Joined | MembershipChange::InvitationAccepted => {
+                        FromMatrix::MemberJoined { chan, nick }
+                    }
+                    MembershipChange::Left
+                    | MembershipChange::Kicked
+                    | MembershipChange::Banned
+                    | MembershipChange::KickedAndBanned => {
+                        let reason = orig.content.reason.clone();
+                        FromMatrix::MemberLeft { chan, nick, reason }
+                    }
+                    _ => return,
+                };
+                let _ = bridge.from_matrix.send(event);
             }
         });
     }

@@ -166,6 +166,20 @@ async fn handle_matrix_event(
                 send(write, srv("TOPIC", vec![chan, topic])).await?;
             }
         }
+        FromMatrix::MemberJoined { chan, nick } => {
+            if !s.registered || !s.joined.contains(&chan) { return Ok(()); }
+            let prefix = format!("{nick}!{nick}@matrix");
+            send(write, Message::with_prefix(prefix, "JOIN", vec![chan])).await?;
+        }
+        FromMatrix::MemberLeft { chan, nick, reason } => {
+            if !s.registered || !s.joined.contains(&chan) { return Ok(()); }
+            let prefix = format!("{nick}!{nick}@matrix");
+            let mut params = vec![chan];
+            if let Some(r) = reason {
+                params.push(r);
+            }
+            send(write, Message::with_prefix(prefix, "PART", params)).await?;
+        }
     }
     Ok(())
 }
@@ -1275,6 +1289,53 @@ mod tests {
         ).await;
         assert!(out.contains("PRIVMSG #room-a one\r\n"));
         assert!(out.contains("PRIVMSG #room-a two\r\n"));
+    }
+
+    #[tokio::test]
+    async fn member_joined_emits_irc_join() {
+        let (b, _rx) = Bridge::new(Mapping::default());
+        let mut s = registered_state("pawelb");
+        s.joined.insert("#room-a".into());
+        let out = route(
+            FromMatrix::MemberJoined { chan: "#room-a".into(), nick: "alice".into() },
+            &b, &mut s,
+        ).await;
+        assert_eq!(out, ":alice!alice@matrix JOIN #room-a\r\n");
+    }
+
+    #[tokio::test]
+    async fn member_left_emits_irc_part_with_reason() {
+        let (b, _rx) = Bridge::new(Mapping::default());
+        let mut s = registered_state("pawelb");
+        s.joined.insert("#room-a".into());
+        let out = route(
+            FromMatrix::MemberLeft { chan: "#room-a".into(), nick: "alice".into(), reason: Some("see you later".into()) },
+            &b, &mut s,
+        ).await;
+        assert_eq!(out, ":alice!alice@matrix PART #room-a :see you later\r\n");
+    }
+
+    #[tokio::test]
+    async fn member_left_without_reason_omits_trailing() {
+        let (b, _rx) = Bridge::new(Mapping::default());
+        let mut s = registered_state("pawelb");
+        s.joined.insert("#room-a".into());
+        let out = route(
+            FromMatrix::MemberLeft { chan: "#room-a".into(), nick: "alice".into(), reason: None },
+            &b, &mut s,
+        ).await;
+        assert_eq!(out, ":alice!alice@matrix PART #room-a\r\n");
+    }
+
+    #[tokio::test]
+    async fn member_event_unjoined_chan_is_dropped() {
+        let (b, _rx) = Bridge::new(Mapping::default());
+        let mut s = registered_state("pawelb");
+        let out = route(
+            FromMatrix::MemberJoined { chan: "#room-a".into(), nick: "alice".into() },
+            &b, &mut s,
+        ).await;
+        assert!(out.is_empty(), "{out}");
     }
 
     #[tokio::test]

@@ -74,6 +74,15 @@ pub enum FromMatrix {
         chan: String,
         topic: String,
     },
+    MemberJoined {
+        chan: String,
+        nick: String,
+    },
+    MemberLeft {
+        chan: String,
+        nick: String,
+        reason: Option<String>,
+    },
 }
 
 #[derive(Debug)]
