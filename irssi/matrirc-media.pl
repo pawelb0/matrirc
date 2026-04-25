@@ -1,6 +1,7 @@
 use strict;
 use warnings;
 use Irssi;
+use Time::Local qw(timegm);
 use vars qw($VERSION %IRSSI);
 
 $VERSION = '0.5.0';
@@ -85,6 +86,9 @@ sub on_privmsg_event {
     my $own = $server && $server->{nick};
     my $lookup = (defined $own && $target eq $own) ? $nick : $target;
 
+    my $iso = $server->meta_stash_find("time");
+    my $when = parse_iso($iso) // time;
+
     my $info = {
         url     => $url,
         nick    => $nick,
@@ -92,7 +96,7 @@ sub on_privmsg_event {
         kind    => $kind,
         target  => $lookup,
         servtag => $server->{tag},
-        time    => time,
+        time    => $when,
     };
     track($info);
     my $tag = length($name) ? " — $name" : '';
@@ -123,6 +127,15 @@ sub fmt_time {
     my $t = shift // 0;
     my @lt = localtime $t;
     return sprintf("%02d:%02d", $lt[2], $lt[1]);
+}
+
+sub parse_iso {
+    my $s = shift;
+    return undef unless defined $s && length $s;
+    if ($s =~ /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})/) {
+        return eval { timegm($6, $5, $4, $3, $2 - 1, $1 - 1900) };
+    }
+    return undef;
 }
 
 # Async-fetch the picked attachment to a final filesystem path. After fetch,
