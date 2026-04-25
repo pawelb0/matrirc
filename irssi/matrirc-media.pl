@@ -124,6 +124,15 @@ sub pick_in {
     return $list[0] if $spec eq '';
     return $list[int($spec) - 1] if $spec =~ /^\d+$/;
     my $needle = lc $spec;
+    # exact nick match wins (most specific)
+    for my $r (@list) {
+        return $r if lc($r->{nick} // '') eq $needle;
+    }
+    # then nick substring
+    for my $r (@list) {
+        return $r if lc($r->{nick} // '') =~ /\Q$needle\E/;
+    }
+    # finally filename substring
     for my $r (@list) {
         return $r if lc($r->{name} // '') =~ /\Q$needle\E/;
     }

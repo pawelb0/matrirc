@@ -73,7 +73,18 @@ matrirc install-irssi --media
 # restart irssi (or /script load matrirc-media)
 ```
 
-Then `/mediashow [N|name]`, `/mediasave [N|name]`, `/medialist`.
+Commands (run from a channel or query window — that's the scope):
+
+```
+/mediashow [N|name|nick]            fetch + open via $MATRIRC_IMG_OPEN
+/mediasave [N|name|nick] [dir]      fetch + save (default ~/Downloads)
+/medialist [all]                    history; `all` for cross-channel
+```
+
+`N` is an index into the current scope's history. A bare nick
+(`/mediashow phobos`) returns that user's most recent attachment;
+a substring (`/mediashow screenshot`) matches the filename. Prefix
+with `#channel` to override scope (`/mediashow #room 3`).
 
 ## Commands
 
