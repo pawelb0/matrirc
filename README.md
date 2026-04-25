@@ -89,7 +89,7 @@ with `#channel` to override scope (`/mediashow #room 3`).
 
 `/mediasend` always targets the active window; the path argument
 tab-completes. Daemon caps uploads at 100 MiB; bigger files come
-back as HTTP 413.
+back as HTTP 413. Honors `MATRIRC_ATTACH_BIND` if set.
 
 ## Commands
 
@@ -187,6 +187,7 @@ Events:
 - `MATRIRC_RECOVERY_KEY` — for `bootstrap-e2ee`
 - `MATRIRC_ROOM` — bridge only this room id as `#matrix` (dev)
 - `MATRIRC_BIND` — override IRC listen addr (default `127.0.0.1:6667`)
+- `MATRIRC_ATTACH_BIND` — override media-proxy listen addr (default `127.0.0.1:6680`)
 - `RUST_LOG` — `tracing-subscriber` filter
 
 ## Building

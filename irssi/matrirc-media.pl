@@ -17,6 +17,8 @@ my $OPENER  = $ENV{MATRIRC_IMG_OPEN} // 'open';
 my $TMP_DIR = "$ENV{HOME}/.cache/matrirc";
 my $SAVE_DIR = $ENV{MATRIRC_SAVE_DIR} // "$ENV{HOME}/Downloads";
 my $HISTORY = 30;
+my $ATTACH_BIND = $ENV{MATRIRC_ATTACH_BIND} || '127.0.0.1:6680';
+my $ATTACH_BASE = "http://$ATTACH_BIND";
 
 # Media kinds matrirc emits (see src/matrix.rs::msgtype_body).
 my @KINDS = qw(image video audio file);
@@ -431,7 +433,8 @@ sub cmd_mediasend {
     my $base = $path;
     $base =~ s{^.*/}{};
 
-    my $url = sprintf('http://127.0.0.1:6680/upload/%s?filename=%s',
+    my $url = sprintf('%s/upload/%s?filename=%s',
+                      $ATTACH_BASE,
                       urlencode($witem->{name}),
                       urlencode($base));
     if (defined $caption && length $caption) {
