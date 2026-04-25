@@ -74,8 +74,6 @@ pub async fn run_proxy(
     }
 }
 
-// used by the upload handler
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct UploadRequest {
     pub scope: String,
@@ -84,8 +82,6 @@ pub(crate) struct UploadRequest {
     pub content_length: usize,
 }
 
-// used by the upload handler
-#[allow(dead_code)]
 pub(crate) fn parse_upload_request(head: &str) -> Result<UploadRequest, &'static str> {
     let mut lines = head.lines();
     let request_line = lines.next().ok_or("empty request")?;
@@ -134,11 +130,11 @@ async fn handle(
     mut sock: TcpStream,
     client: Client,
     index: Arc<AttachIndex>,
-    _bridge: crate::bridge::Bridge,
+    bridge: crate::bridge::Bridge,
 ) -> Result<()> {
     let mut buf = vec![0u8; MAX_REQ_BYTES];
     let mut total = 0;
-    loop {
+    let header_end = loop {
         if total >= buf.len() {
             return write_status(&mut sock, 431, "Request Header Too Large").await;
         }
@@ -147,11 +143,40 @@ async fn handle(
             return Err(anyhow!("eof before headers"));
         }
         total += n;
-        if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
-            break;
+        if let Some(pos) = buf[..total].windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
+        }
+    };
+    let head_str = std::str::from_utf8(&buf[..header_end]).unwrap_or("");
+    let method = head_str
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| anyhow!("malformed request"))?;
+
+    match method {
+        "GET" => handle_get(sock, head_str, client, index).await,
+        "POST" => {
+            let body_so_far = &buf[header_end..total];
+            handle_upload(sock, head_str, body_so_far, client, &bridge).await
+        }
+        _ => {
+            write_status_with_body(
+                &mut sock,
+                405,
+                "Method Not Allowed",
+                "use GET /attach/<id> or POST /upload/<scope>",
+            )
+            .await
         }
     }
-    let head = std::str::from_utf8(&buf[..total]).unwrap_or("");
+}
+
+async fn handle_get(
+    mut sock: TcpStream,
+    head: &str,
+    client: Client,
+    index: Arc<AttachIndex>,
+) -> Result<()> {
     let request_line = head.lines().next().unwrap_or("");
     let path = request_line
         .split_whitespace()
@@ -196,6 +221,101 @@ async fn handle(
 async fn write_status(sock: &mut TcpStream, code: u16, reason: &str) -> Result<()> {
     let resp = format!(
         "HTTP/1.1 {code} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    sock.write_all(resp.as_bytes()).await?;
+    sock.shutdown().await.ok();
+    Ok(())
+}
+
+const MAX_UPLOAD_BYTES: usize = 100 * 1024 * 1024;
+
+async fn handle_upload(
+    mut sock: TcpStream,
+    head: &str,
+    body_so_far: &[u8],
+    client: Client,
+    bridge: &crate::bridge::Bridge,
+) -> Result<()> {
+    let req = match parse_upload_request(head) {
+        Ok(r) => r,
+        Err(e) => {
+            debug!("upload parse: {e}");
+            return write_status_with_body(&mut sock, 400, "Bad Request", "bad request").await;
+        }
+    };
+    if req.content_length > MAX_UPLOAD_BYTES {
+        return write_status_with_body(
+            &mut sock,
+            413,
+            "Payload Too Large",
+            "too large (max 100 MiB)",
+        )
+        .await;
+    }
+    let Some(room_id) = bridge.resolve_scope(&req.scope) else {
+        return write_status_with_body(
+            &mut sock,
+            404,
+            "Unknown Scope",
+            &format!("no room for {}", req.scope),
+        )
+        .await;
+    };
+    let Some(room) = client.get_room(&room_id) else {
+        return write_status_with_body(&mut sock, 404, "Room Gone", "room no longer joined").await;
+    };
+
+    let mut body = Vec::with_capacity(req.content_length);
+    body.extend_from_slice(body_so_far);
+    while body.len() < req.content_length {
+        let mut chunk = [0u8; 16 * 1024];
+        let n = sock.read(&mut chunk).await?;
+        if n == 0 {
+            return write_status_with_body(
+                &mut sock,
+                400,
+                "Body Truncated",
+                "body shorter than content-length",
+            )
+            .await;
+        }
+        body.extend_from_slice(&chunk[..n]);
+        if body.len() > MAX_UPLOAD_BYTES {
+            return write_status_with_body(
+                &mut sock,
+                413,
+                "Payload Too Large",
+                "too large (max 100 MiB)",
+            )
+            .await;
+        }
+    }
+    body.truncate(req.content_length);
+
+    let cfg = matrix_sdk::attachment::AttachmentConfig::new().caption(req.caption);
+    let mime = mime_guess::from_path(&req.filename).first_or_octet_stream();
+
+    match room.send_attachment(&req.filename, &mime, body, cfg).await {
+        Ok(_resp) => write_status(&mut sock, 200, "OK").await,
+        Err(e) => {
+            warn!(%room_id, "upload failed: {e:#}");
+            write_status_with_body(&mut sock, 502, "Upstream Error", &format!("{e}")).await
+        }
+    }
+}
+
+async fn write_status_with_body(
+    sock: &mut TcpStream,
+    code: u16,
+    reason: &str,
+    body: &str,
+) -> Result<()> {
+    let resp = format!(
+        "HTTP/1.1 {code} {reason}\r\n\
+         Content-Type: text/plain; charset=utf-8\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
+        body.len()
     );
     sock.write_all(resp.as_bytes()).await?;
     sock.shutdown().await.ok();
