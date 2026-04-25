@@ -980,20 +980,42 @@ async fn read_line<R: tokio::io::AsyncBufRead + Unpin>(
     Ok(Some(line))
 }
 
+const MASCOT: &[&str] = &[
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣤⡀⠀⣿⣿⠆",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢸⡿⠇⠀⣿⠁⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣸⣧⣴⣶⣿⡀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣴⣿⣿⣿⣿⣿⣿⡄",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢿⣿⣿⣿⣿⣿⣿⠇",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⣿⣿⣿⣿⠿⠋⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣾⣿⣿⣿⣿⣿⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣀⣴⣿⣿⣿⣿⣿⣿⣿⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣀⣤⣶⣿⣿⣿⣿⣿⣿⣿⣿⣿⡏⠀⠀⠀",
+    "⠀⠀⣀⣀⣤⣴⣶⣶⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠟⠀⠀⠀⠀",
+    "⠐⠿⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠿⠛⠁⠀⠀⠀⠀⠀",
+];
+
 async fn send_welcome(write: &mut (impl tokio::io::AsyncWrite + Unpin), nick: &str) -> Result<()> {
     let n = nick.to_string();
-    let lines: &[(&str, Vec<String>)] = &[
+    let header: &[(&str, Vec<String>)] = &[
         (rpl::WELCOME, vec![n.clone(), format!("Welcome to matrirc, {nick}")]),
         (rpl::YOURHOST, vec![n.clone(), format!("Your host is {SERVER_NAME}, running {VERSION}")]),
         (rpl::CREATED, vec![n.clone(), "This server has no creation date".into()]),
         (rpl::MYINFO, vec![n.clone(), SERVER_NAME.into(), VERSION.into(), String::new(), String::new()]),
         (rpl::MOTDSTART, vec![n.clone(), format!("- {SERVER_NAME} Message of the day -")]),
+    ];
+    for (code, params) in header {
+        send(write, srv(code, params.clone())).await?;
+    }
+    for line in MASCOT {
+        send(write, srv(rpl::MOTD, vec![n.clone(), (*line).into()])).await?;
+    }
+    let footer: &[(&str, Vec<String>)] = &[
         (rpl::MOTD, vec![n.clone(), "- Matrix rooms auto-joined after this line.".into()]),
         (rpl::MOTD, vec![n.clone(), "- /msg matrirc help  for bridge commands.".into()]),
         (rpl::MOTD, vec![n.clone(), format!("- /join {ECHO_CHAN}  for a local echo channel.")]),
         (rpl::ENDOFMOTD, vec![n, "End of /MOTD command.".into()]),
     ];
-    for (code, params) in lines {
+    for (code, params) in footer {
         send(write, srv(code, params.clone())).await?;
     }
     Ok(())
