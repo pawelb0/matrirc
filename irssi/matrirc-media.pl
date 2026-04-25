@@ -219,10 +219,14 @@ Irssi::signal_add('pidwait' => sub {
 
 sub cmd_mediashow {
     my ($args, $server, $witem) = @_;
+    if (!$witem || !$witem->{name}) {
+        Irssi::print("mediashow: run from a channel or query window");
+        return;
+    }
     $args =~ s/^\s+|\s+$//g;
     my $info = pick($args, $witem);
     if (!$info) {
-        Irssi::print("mediashow: no match (history: " . scalar(@recent) . ")");
+        Irssi::print("mediashow: no match in $witem->{name}");
         return;
     }
     fetch_async(
@@ -242,18 +246,22 @@ sub cmd_mediashow {
         },
     );
     my $tag = length($info->{name}) ? $info->{name} : $info->{url};
-    Irssi::print("mediashow: fetching $info->{kind} from $info->{nick}: $tag");
+    Irssi::print("mediashow: fetching $info->{kind} from $info->{nick} in $info->{target}: $tag");
 }
 
 sub cmd_mediasave {
     my ($args, $server, $witem) = @_;
+    if (!$witem || !$witem->{name}) {
+        Irssi::print("mediasave: run from a channel or query window");
+        return;
+    }
     my @parts = split /\s+/, ($args // ''), 2;
     my $spec = $parts[0] // '';
     my $dest_dir = $parts[1] // $SAVE_DIR;
     $dest_dir =~ s{^~}{$ENV{HOME}};
     my $info = pick($spec, $witem);
     if (!$info) {
-        Irssi::print("mediasave: no match (history: " . scalar(@recent) . ")");
+        Irssi::print("mediasave: no match in $witem->{name}");
         return;
     }
     fetch_async(
