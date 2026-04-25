@@ -448,4 +448,20 @@ Irssi::command_bind('mediasave' => \&cmd_mediasave);
 Irssi::command_bind('medialist' => \&cmd_medialist);
 Irssi::command_bind('mediasend' => \&cmd_mediasend);
 
+Irssi::signal_add_first('complete word', sub {
+    my ($complist, $window, $word, $linestart, $want_space) = @_;
+    return unless defined $linestart && $linestart =~ m{^/mediasend\b};
+    $word //= '';
+    my $glob = $word;
+    my $had_tilde = $glob =~ s{^~}{$ENV{HOME}};
+    my @matches = glob("$glob*");
+    return unless @matches;
+    for my $m (@matches) {
+        if ($had_tilde) { $m =~ s{^\Q$ENV{HOME}\E}{~}; }
+        if (-d $m) { $m .= '/'; }
+        push @$complist, $m;
+    }
+    Irssi::signal_stop();
+});
+
 Irssi::print("matrirc-media $VERSION loaded; /mediashow, /mediasave, /medialist, /mediasend");
