@@ -161,7 +161,7 @@ mod tests {
 
     #[test]
     fn suffix_extraction() {
-        let r = RoomId::parse("!xSOrIjerDiOWOxmkjX:chat.angrybits.pl").unwrap();
+        let r = RoomId::parse("!xSOrIjerDiOWOxmkjX:example.org").unwrap();
         assert_eq!(room_id_suffix(&r), "xSOrIj");
     }
 

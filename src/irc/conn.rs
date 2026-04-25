@@ -1082,7 +1082,7 @@ mod tests {
         let (b, _rx) = Bridge::new(Mapping::default());
         let r = room("!a:server");
         b.add_mapping(r.clone(), "#room-a".into(), "topic".into());
-        let mut s = registered_state("pawelb");
+        let mut s = registered_state("alice");
         s.joined.insert("#room-a".into());
         let out = route(
             FromMatrix::Message { room: r, sender_nick: "alice".into(), body: "hi".into(), is_own: false },
@@ -1097,14 +1097,14 @@ mod tests {
         let r = room("!dm:server");
         {
             let mut m = b.mapping.write().unwrap();
-            m.insert_dm(r.clone(), "phobos", &[]);
+            m.insert_dm(r.clone(), "bob", &[]);
         }
-        let mut s = registered_state("pawelb");
+        let mut s = registered_state("alice");
         let out = route(
-            FromMatrix::Message { room: r, sender_nick: "phobos".into(), body: "yo".into(), is_own: false },
+            FromMatrix::Message { room: r, sender_nick: "bob".into(), body: "yo".into(), is_own: false },
             &b, &mut s,
         ).await;
-        assert_eq!(out, ":phobos!phobos@matrix PRIVMSG pawelb yo\r\n");
+        assert_eq!(out, ":bob!bob@matrix PRIVMSG alice yo\r\n");
     }
 
     #[tokio::test]
@@ -1113,20 +1113,20 @@ mod tests {
         let r = room("!dm:server");
         {
             let mut m = b.mapping.write().unwrap();
-            m.insert_dm(r.clone(), "phobos", &[]);
+            m.insert_dm(r.clone(), "bob", &[]);
         }
-        let mut s = registered_state("pawelb");
+        let mut s = registered_state("alice");
         let out = route(
-            FromMatrix::Message { room: r, sender_nick: "pawelb".into(), body: "from other device".into(), is_own: true },
+            FromMatrix::Message { room: r, sender_nick: "alice".into(), body: "from other device".into(), is_own: true },
             &b, &mut s,
         ).await;
-        assert_eq!(out, ":pawelb!pawelb@matrirc.local PRIVMSG phobos :from other device\r\n");
+        assert_eq!(out, ":alice!alice@matrirc.local PRIVMSG bob :from other device\r\n");
     }
 
     #[tokio::test]
     async fn unknown_room_is_dropped() {
         let (b, _rx) = Bridge::new(Mapping::default());
-        let mut s = registered_state("pawelb");
+        let mut s = registered_state("alice");
         let out = route(
             FromMatrix::Message { room: room("!nope:server"), sender_nick: "alice".into(), body: "hi".into(), is_own: false },
             &b, &mut s,
@@ -1139,7 +1139,7 @@ mod tests {
         let (b, _rx) = Bridge::new(Mapping::default());
         let r = room("!a:server");
         b.add_mapping(r.clone(), "#room-a".into(), "".into());
-        let mut s = registered_state("pawelb"); // no joined insert
+        let mut s = registered_state("alice"); // no joined insert
         let out = route(
             FromMatrix::Message { room: r, sender_nick: "alice".into(), body: "hi".into(), is_own: false },
             &b, &mut s,
@@ -1150,7 +1150,7 @@ mod tests {
     #[tokio::test]
     async fn topic_changed_emits_topic() {
         let (b, _rx) = Bridge::new(Mapping::default());
-        let mut s = registered_state("pawelb");
+        let mut s = registered_state("alice");
         s.joined.insert("#room-a".into());
         let out = route(
             FromMatrix::TopicChanged { chan: "#room-a".into(), topic: "new topic".into() },
@@ -1162,13 +1162,13 @@ mod tests {
     #[tokio::test]
     async fn dm_added_emits_notice() {
         let (b, _rx) = Bridge::new(Mapping::default());
-        let mut s = registered_state("pawelb");
+        let mut s = registered_state("alice");
         let out = route(
-            FromMatrix::DmAdded { nick: "phobos".into() },
+            FromMatrix::DmAdded { nick: "bob".into() },
             &b, &mut s,
         ).await;
-        assert!(out.contains("NOTICE pawelb"), "{out}");
-        assert!(out.contains("phobos"), "{out}");
+        assert!(out.contains("NOTICE alice"), "{out}");
+        assert!(out.contains("bob"), "{out}");
     }
 
     async fn dispatch(
@@ -1186,7 +1186,7 @@ mod tests {
     #[tokio::test]
     async fn ping_replies_pong() {
         let (b, _rx) = Bridge::new(Mapping::default());
-        let mut s = registered_state("pawelb");
+        let mut s = registered_state("alice");
         let out = dispatch("PING :abc", &b, &mut s).await;
         assert_eq!(out, ":matrirc.local PONG matrirc.local abc\r\n");
     }
@@ -1194,27 +1194,27 @@ mod tests {
     #[tokio::test]
     async fn join_echo_channel_emits_ack_topic_names() {
         let (b, _rx) = Bridge::new(Mapping::default());
-        let mut s = registered_state("pawelb");
+        let mut s = registered_state("alice");
         let out = dispatch("JOIN #echo", &b, &mut s).await;
-        assert!(out.contains(":pawelb!pawelb@matrirc.local JOIN #echo"), "{out}");
-        assert!(out.contains(":matrirc.local 332 pawelb #echo"), "{out}");
+        assert!(out.contains(":alice!alice@matrirc.local JOIN #echo"), "{out}");
+        assert!(out.contains(":matrirc.local 332 alice #echo"), "{out}");
         assert!(out.contains(" echo"), "names list should include echo: {out}");
-        assert!(out.contains(":matrirc.local 366 pawelb #echo"), "{out}");
+        assert!(out.contains(":matrirc.local 366 alice #echo"), "{out}");
         assert!(s.joined.contains("#echo"));
     }
 
     #[tokio::test]
     async fn join_unknown_channel_returns_403() {
         let (b, _rx) = Bridge::new(Mapping::default());
-        let mut s = registered_state("pawelb");
+        let mut s = registered_state("alice");
         let out = dispatch("JOIN #nope", &b, &mut s).await;
-        assert!(out.contains(":matrirc.local 403 pawelb #nope"), "{out}");
+        assert!(out.contains(":matrirc.local 403 alice #nope"), "{out}");
     }
 
     #[tokio::test]
     async fn privmsg_echo_channel_echoes_back() {
         let (b, _rx) = Bridge::new(Mapping::default());
-        let mut s = registered_state("pawelb");
+        let mut s = registered_state("alice");
         let out = dispatch("PRIVMSG #echo :hi there", &b, &mut s).await;
         assert!(out.contains(":echo!echo@matrirc.local PRIVMSG #echo :echo: hi there"), "{out}");
     }
@@ -1222,15 +1222,15 @@ mod tests {
     #[tokio::test]
     async fn privmsg_to_unknown_returns_401() {
         let (b, _rx) = Bridge::new(Mapping::default());
-        let mut s = registered_state("pawelb");
+        let mut s = registered_state("alice");
         let out = dispatch("PRIVMSG nobody :hello", &b, &mut s).await;
-        assert!(out.contains(":matrirc.local 401 pawelb nobody"), "{out}");
+        assert!(out.contains(":matrirc.local 401 alice nobody"), "{out}");
     }
 
     #[tokio::test]
     async fn privmsg_to_bot_help_lists_commands() {
         let (b, _rx) = Bridge::new(Mapping::default());
-        let mut s = registered_state("pawelb");
+        let mut s = registered_state("alice");
         let out = dispatch("PRIVMSG matrirc :help", &b, &mut s).await;
         assert!(out.contains("matrirc — local Matrix↔IRC bridge"), "{out}");
         assert!(out.contains("help"), "{out}");
@@ -1240,16 +1240,16 @@ mod tests {
     #[tokio::test]
     async fn whois_echo_returns_311_and_318() {
         let (b, _rx) = Bridge::new(Mapping::default());
-        let mut s = registered_state("pawelb");
+        let mut s = registered_state("alice");
         let out = dispatch("WHOIS echo", &b, &mut s).await;
-        assert!(out.contains(":matrirc.local 311 pawelb echo"), "{out}");
-        assert!(out.contains(":matrirc.local 318 pawelb echo"), "{out}");
+        assert!(out.contains(":matrirc.local 311 alice echo"), "{out}");
+        assert!(out.contains(":matrirc.local 318 alice echo"), "{out}");
     }
 
     #[tokio::test]
     async fn ctcp_action_to_bot_is_silent() {
         let (b, _rx) = Bridge::new(Mapping::default());
-        let mut s = registered_state("pawelb");
+        let mut s = registered_state("alice");
         let out = dispatch("PRIVMSG matrirc :\x01ACTION waves\x01", &b, &mut s).await;
         assert!(out.is_empty(), "bot should not emit for CTCP: {out:?}");
     }
@@ -1257,9 +1257,9 @@ mod tests {
     #[tokio::test]
     async fn nick_post_registration_echoes_and_routes_to_matrix() {
         let (b, mut rx) = Bridge::new(Mapping::default());
-        let mut s = registered_state("pawelb");
+        let mut s = registered_state("alice");
         let out = dispatch("NICK newnick", &b, &mut s).await;
-        assert_eq!(out, ":pawelb!pawelb@matrirc.local NICK newnick\r\n");
+        assert_eq!(out, ":alice!alice@matrirc.local NICK newnick\r\n");
         assert_eq!(s.nick.as_deref(), Some("newnick"));
         match rx.try_recv() {
             Ok(ToMatrix::SetDisplayName { name }) => assert_eq!(name, "newnick"),
@@ -1270,8 +1270,8 @@ mod tests {
     #[tokio::test]
     async fn nick_same_value_is_noop() {
         let (b, mut rx) = Bridge::new(Mapping::default());
-        let mut s = registered_state("pawelb");
-        let out = dispatch("NICK pawelb", &b, &mut s).await;
+        let mut s = registered_state("alice");
+        let out = dispatch("NICK alice", &b, &mut s).await;
         assert!(out.is_empty(), "{out:?}");
         assert!(rx.try_recv().is_err(), "no SetDisplayName for same nick");
     }
@@ -1281,7 +1281,7 @@ mod tests {
         let (b, _rx) = Bridge::new(Mapping::default());
         let r = room("!a:server");
         b.add_mapping(r.clone(), "#room-a".into(), "".into());
-        let mut s = registered_state("pawelb");
+        let mut s = registered_state("alice");
         s.joined.insert("#room-a".into());
         let out = route(
             FromMatrix::Message { room: r, sender_nick: "alice".into(), body: "one\ntwo".into(), is_own: false },
@@ -1294,7 +1294,7 @@ mod tests {
     #[tokio::test]
     async fn member_joined_emits_irc_join() {
         let (b, _rx) = Bridge::new(Mapping::default());
-        let mut s = registered_state("pawelb");
+        let mut s = registered_state("alice");
         s.joined.insert("#room-a".into());
         let out = route(
             FromMatrix::MemberJoined { chan: "#room-a".into(), nick: "alice".into() },
@@ -1306,7 +1306,7 @@ mod tests {
     #[tokio::test]
     async fn member_left_emits_irc_part_with_reason() {
         let (b, _rx) = Bridge::new(Mapping::default());
-        let mut s = registered_state("pawelb");
+        let mut s = registered_state("alice");
         s.joined.insert("#room-a".into());
         let out = route(
             FromMatrix::MemberLeft { chan: "#room-a".into(), nick: "alice".into(), reason: Some("see you later".into()) },
@@ -1318,7 +1318,7 @@ mod tests {
     #[tokio::test]
     async fn member_left_without_reason_omits_trailing() {
         let (b, _rx) = Bridge::new(Mapping::default());
-        let mut s = registered_state("pawelb");
+        let mut s = registered_state("alice");
         s.joined.insert("#room-a".into());
         let out = route(
             FromMatrix::MemberLeft { chan: "#room-a".into(), nick: "alice".into(), reason: None },
@@ -1330,7 +1330,7 @@ mod tests {
     #[tokio::test]
     async fn member_event_unjoined_chan_is_dropped() {
         let (b, _rx) = Bridge::new(Mapping::default());
-        let mut s = registered_state("pawelb");
+        let mut s = registered_state("alice");
         let out = route(
             FromMatrix::MemberJoined { chan: "#room-a".into(), nick: "alice".into() },
             &b, &mut s,
@@ -1353,15 +1353,17 @@ mod tests {
             }
         });
 
-        let mut s = State::default();
-        s.nick = Some("pawelb".into());
-        s.user = Some("pawelb".into());
+        let mut s = State {
+            nick: Some("carol".into()),
+            user: Some("carol".into()),
+            ..State::default()
+        };
 
         let mut out = Vec::<u8>::new();
-        auto_join_all(&mut out, "pawelb", &b, &mut s).await.unwrap();
+        auto_join_all(&mut out, "carol", &b, &mut s).await.unwrap();
         let out = String::from_utf8(out).unwrap();
 
-        assert!(out.contains("353 pawelb = #room-a :alice bob pawelb"), "names: {out}");
-        assert!(!out.contains(":matrix pawelb"), "placeholder leaked: {out}");
+        assert!(out.contains("353 carol = #room-a :alice bob carol"), "names: {out}");
+        assert!(!out.contains(":matrix carol"), "placeholder leaked: {out}");
     }
 }

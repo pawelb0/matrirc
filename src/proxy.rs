@@ -183,7 +183,7 @@ mod tests {
         }
         let oldest: OwnedEventId = EventId::parse("$evt0:server.tld").unwrap();
         let newest: OwnedEventId =
-            EventId::parse(&format!("$evt{}:server.tld", MAX_INDEX + 4)).unwrap();
+            EventId::parse(format!("$evt{}:server.tld", MAX_INDEX + 4)).unwrap();
         assert!(idx.get(&oldest).is_none());
         assert!(idx.get(&newest).is_some());
     }
