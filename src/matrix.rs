@@ -12,6 +12,7 @@ use matrix_sdk::ruma::events::room::message::{
     MessageType, Relation, RoomMessageEventContent, SyncRoomMessageEvent,
 };
 use matrix_sdk::ruma::events::room::topic::SyncRoomTopicEvent;
+use matrix_sdk::ruma::events::room::MediaSource;
 use matrix_sdk::ruma::events::{
     AnySyncMessageLikeEvent, AnySyncTimelineEvent, SyncMessageLikeEvent,
 };
@@ -126,12 +127,16 @@ fn sanitize_nick(s: &str) -> String {
     capped
 }
 
-fn body_from_event(content: &RoomMessageEventContent, homeserver: &str) -> Option<String> {
+fn body_from_event(
+    content: &RoomMessageEventContent,
+    event_id: &matrix_sdk::ruma::EventId,
+    attach_base: &str,
+) -> Option<String> {
     if let Some(Relation::Replacement(repl)) = &content.relates_to {
-        let new_body = msgtype_body(&repl.new_content.msgtype, homeserver)?;
+        let new_body = msgtype_body(&repl.new_content.msgtype, event_id, attach_base)?;
         return Some(format!("{C_GREY}* edit:{C_RESET} {}", strip_reply_fallback(&new_body)));
     }
-    let raw = msgtype_body(&content.msgtype, homeserver)?;
+    let raw = msgtype_body(&content.msgtype, event_id, attach_base)?;
     if matches!(content.msgtype, MessageType::Emote(_)) {
         return Some(raw);
     }
@@ -144,15 +149,19 @@ fn body_from_event(content: &RoomMessageEventContent, homeserver: &str) -> Optio
     }
 }
 
-fn msgtype_body(msg: &MessageType, homeserver: &str) -> Option<String> {
+fn msgtype_body(
+    msg: &MessageType,
+    event_id: &matrix_sdk::ruma::EventId,
+    attach_base: &str,
+) -> Option<String> {
     match msg {
         MessageType::Text(t) => Some(t.body.clone()),
         MessageType::Notice(t) => Some(t.body.clone()),
         MessageType::Emote(t) => Some(format!("\x01ACTION {}\x01", t.body)),
-        MessageType::Image(m) => Some(media_line("image", &m.body, &m.source, homeserver)),
-        MessageType::File(m) => Some(media_line("file", &m.body, &m.source, homeserver)),
-        MessageType::Audio(m) => Some(media_line("audio", &m.body, &m.source, homeserver)),
-        MessageType::Video(m) => Some(media_line("video", &m.body, &m.source, homeserver)),
+        MessageType::Image(m) => Some(media_line("image", &m.body, event_id, attach_base)),
+        MessageType::File(m) => Some(media_line("file", &m.body, event_id, attach_base)),
+        MessageType::Audio(m) => Some(media_line("audio", &m.body, event_id, attach_base)),
+        MessageType::Video(m) => Some(media_line("video", &m.body, event_id, attach_base)),
         MessageType::Location(m) => Some(format!("{C_SILVER}[location]{C_RESET} {}", m.body)),
         MessageType::ServerNotice(m) => Some(format!("{C_GREY}[server-notice]{C_RESET} {}", m.body)),
         _ => None,
@@ -162,27 +171,37 @@ fn msgtype_body(msg: &MessageType, homeserver: &str) -> Option<String> {
 fn media_line(
     kind: &str,
     caption: &str,
-    source: &matrix_sdk::ruma::events::room::MediaSource,
-    homeserver: &str,
+    event_id: &matrix_sdk::ruma::EventId,
+    attach_base: &str,
 ) -> String {
-    use matrix_sdk::ruma::events::room::MediaSource;
-    let url = match source {
-        MediaSource::Plain(mxc) => mxc_to_https(mxc.as_str(), homeserver).unwrap_or_else(|| mxc.to_string()),
-        MediaSource::Encrypted(file) => {
-            let base = mxc_to_https(file.url.as_str(), homeserver).unwrap_or_else(|| file.url.to_string());
-            format!("{base} (encrypted)")
-        }
-    };
-    format!("{C_SILVER}[{kind}]{C_RESET} {caption} <{url}>")
+    format!(
+        "{C_SILVER}[{kind}]{C_RESET} {caption} <{attach_base}/attach/{event_id}>"
+    )
 }
 
-fn mxc_to_https(mxc: &str, homeserver: &str) -> Option<String> {
-    let rest = mxc.strip_prefix("mxc://")?;
-    let (server, media_id) = rest.split_once('/')?;
-    Some(format!(
-        "{}/_matrix/media/v3/download/{server}/{media_id}",
-        homeserver.trim_end_matches('/')
-    ))
+fn media_source_of(msg: &MessageType) -> Option<MediaSource> {
+    match msg {
+        MessageType::Image(m) => Some(m.source.clone()),
+        MessageType::File(m) => Some(m.source.clone()),
+        MessageType::Audio(m) => Some(m.source.clone()),
+        MessageType::Video(m) => Some(m.source.clone()),
+        _ => None,
+    }
+}
+
+fn index_attachments(
+    index: &crate::proxy::AttachIndex,
+    event_id: &matrix_sdk::ruma::EventId,
+    content: &RoomMessageEventContent,
+) {
+    if let Some(src) = media_source_of(&content.msgtype) {
+        index.insert(event_id.to_owned(), src);
+    }
+    if let Some(Relation::Replacement(repl)) = &content.relates_to {
+        if let Some(src) = media_source_of(&repl.new_content.msgtype) {
+            index.insert(event_id.to_owned(), src);
+        }
+    }
 }
 
 /// Matrix replies embed "> <sender> quoted\n> ...\n\nactual body" in `body`
@@ -430,7 +449,8 @@ async fn backfill(
     client: &Client,
     room_id: &matrix_sdk::ruma::RoomId,
     limit: u32,
-    homeserver: &str,
+    attach_base: &str,
+    attach_index: &crate::proxy::AttachIndex,
 ) -> Vec<BackfillMessage> {
     let Some(room) = client.get_room(room_id) else { return Vec::new(); };
     if matches!(room.encryption_state(), EncryptionState::Encrypted) {
@@ -477,7 +497,8 @@ async fn backfill(
             AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
                 SyncMessageLikeEvent::Original(orig),
             )) => {
-                let Some(body) = body_from_event(&orig.content, homeserver) else { continue; };
+                index_attachments(attach_index, &orig.event_id, &orig.content);
+                let Some(body) = body_from_event(&orig.content, &orig.event_id, attach_base) else { continue; };
                 out.push(BackfillMessage {
                     sender_nick: sender_nick(&room, &orig.sender).await,
                     body,
@@ -636,6 +657,22 @@ pub async fn run_sync(
         "bridge populated; starting sync loop"
     );
 
+    let attach_index = crate::proxy::AttachIndex::new();
+    let attach_addr: std::net::SocketAddr = std::env::var("MATRIRC_ATTACH_BIND")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| "127.0.0.1:6680".parse().unwrap());
+    let attach_base = format!("http://{attach_addr}");
+    {
+        let proxy_client = client.clone();
+        let proxy_index = attach_index.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::proxy::run_proxy(attach_addr, proxy_client, proxy_index).await {
+                warn!("attach proxy stopped: {e:#}");
+            }
+        });
+    }
+
     {
         let bridge = bridge.clone();
         client.add_event_handler(move |ev: SyncRoomTopicEvent, room: Room| {
@@ -715,16 +752,19 @@ pub async fn run_sync(
 
     {
         let bridge = bridge.clone();
-        let homeserver = cfg.homeserver_url.clone();
         let own = own_id;
+        let attach_base = attach_base.clone();
+        let attach_index = attach_index.clone();
         client.add_event_handler(move |ev: SyncRoomMessageEvent, room: Room| {
             let bridge = bridge.clone();
-            let homeserver = homeserver.clone();
             let own = own.clone();
+            let attach_base = attach_base.clone();
+            let attach_index = attach_index.clone();
             async move {
                 let Some(orig) = ev.as_original() else { return; };
                 let Some((nick, is_own)) = accept_event(&bridge, &room, &orig.event_id, &orig.sender, &own).await else { return; };
-                let Some(body) = body_from_event(&orig.content, &homeserver) else { return; };
+                index_attachments(&attach_index, &orig.event_id, &orig.content);
+                let Some(body) = body_from_event(&orig.content, &orig.event_id, &attach_base) else { return; };
                 emit_message(&bridge, room.room_id(), nick, body, is_own);
             }
         });
@@ -732,7 +772,8 @@ pub async fn run_sync(
 
     let send_client = client.clone();
     let send_bridge = bridge.clone();
-    let homeserver_for_sender = cfg.homeserver_url.clone();
+    let attach_base_sender = attach_base.clone();
+    let attach_index_sender = attach_index.clone();
     let name_store_for_sender = name_store.clone();
     tokio::spawn(async move {
         while let Some(cmd) = to_matrix.recv().await {
@@ -744,7 +785,7 @@ pub async fn run_sync(
                     send_to_mxid(&send_client, &send_bridge, &mxid, &body, emote, notice).await;
                 }
                 ToMatrix::Backfill { room, limit, reply } => {
-                    let result = backfill(&send_client, &room, limit, &homeserver_for_sender).await;
+                    let result = backfill(&send_client, &room, limit, &attach_base_sender, &attach_index_sender).await;
                     let _ = reply.send(result);
                 }
                 ToMatrix::Members { room, reply } => {
@@ -1013,10 +1054,14 @@ mod tests {
     };
     use matrix_sdk::ruma::OwnedMxcUri;
 
-    const HS: &str = "https://example.org";
+    const ATTACH: &str = "http://127.0.0.1:6680";
 
     fn content(m: MessageType) -> RoomMessageEventContent {
         RoomMessageEventContent::new(m)
+    }
+
+    fn evt(s: &str) -> matrix_sdk::ruma::OwnedEventId {
+        matrix_sdk::ruma::EventId::parse(s).unwrap()
     }
 
     #[test]
@@ -1034,26 +1079,29 @@ mod tests {
 
     #[test]
     fn body_text_and_notice_pass_through() {
+        let id = evt("$abc:server.tld");
         let t = content(MessageType::Text(TextMessageEventContent::plain("hi")));
-        assert_eq!(body_from_event(&t, HS).as_deref(), Some("hi"));
+        assert_eq!(body_from_event(&t, &id, ATTACH).as_deref(), Some("hi"));
         let n = content(MessageType::Notice(NoticeMessageEventContent::plain("bye")));
-        assert_eq!(body_from_event(&n, HS).as_deref(), Some("bye"));
+        assert_eq!(body_from_event(&n, &id, ATTACH).as_deref(), Some("bye"));
     }
 
     #[test]
     fn body_emote_wraps_ctcp_action() {
+        let id = evt("$abc:server.tld");
         let e = content(MessageType::Emote(EmoteMessageEventContent::plain("waves")));
-        assert_eq!(body_from_event(&e, HS).as_deref(), Some("\x01ACTION waves\x01"));
+        assert_eq!(body_from_event(&e, &id, ATTACH).as_deref(), Some("\x01ACTION waves\x01"));
     }
 
     #[test]
-    fn body_image_resolves_mxc_to_https() {
+    fn body_image_emits_attach_proxy_url() {
+        let id = evt("$abc:server.tld");
         let mxc = OwnedMxcUri::from("mxc://example.org/abc123");
         let img = content(MessageType::Image(ImageMessageEventContent::plain("kitten.png".into(), mxc)));
-        let out = body_from_event(&img, HS).unwrap();
+        let out = body_from_event(&img, &id, ATTACH).unwrap();
         assert!(out.contains("[image]"), "{out}");
         assert!(out.contains("kitten.png"), "{out}");
-        assert!(out.contains("https://example.org/_matrix/media/v3/download/example.org/abc123"), "{out}");
+        assert!(out.contains("http://127.0.0.1:6680/attach/$abc:server.tld"), "{out}");
     }
 
     #[test]
@@ -1065,16 +1113,6 @@ mod tests {
     fn strip_reply_fallback_drops_quoted_header() {
         let src = "> <@a:h> first line\n> second line\n\nactual reply";
         assert_eq!(strip_reply_fallback(src), "actual reply");
-    }
-
-    #[test]
-    fn mxc_to_https_valid_and_invalid() {
-        assert_eq!(
-            mxc_to_https("mxc://server.org/id42", "https://hs.example.org/"),
-            Some("https://hs.example.org/_matrix/media/v3/download/server.org/id42".into()),
-        );
-        assert_eq!(mxc_to_https("http://not-mxc/x", HS), None);
-        assert_eq!(mxc_to_https("mxc://no-slash", HS), None);
     }
 
     #[test]

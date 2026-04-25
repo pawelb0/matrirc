@@ -7,6 +7,7 @@ mod daemon;
 mod irc;
 mod matrix;
 mod names;
+mod proxy;
 
 use anyhow::Result;
 use clap::Parser;
@@ -19,7 +20,7 @@ async fn main() -> Result<()> {
     let args = Cli::parse();
     match args.command.unwrap_or(Command::Run) {
         Command::Run => run().await,
-        Command::InstallIrssi { force, dry_run, bin } => cli::install_irssi(force, dry_run, bin),
+        Command::InstallIrssi { force, dry_run, bin, media } => cli::install_irssi(force, dry_run, bin, media),
         Command::Login { mxid, homeserver, token, skip_verify } => {
             cli::login(&mxid, homeserver.as_deref(), token, skip_verify).await
         }

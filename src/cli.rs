@@ -8,6 +8,7 @@ use crate::config::config_path;
 use crate::matrix;
 
 const PERL_TEMPLATE: &str = include_str!("../irssi/matrirc.pl.in");
+const MEDIA_SCRIPT: &str = include_str!("../irssi/matrirc-media.pl");
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Local IRC server bridging to a Matrix homeserver")]
@@ -32,6 +33,9 @@ pub enum Command {
         /// Useful for dev builds (`target/debug/matrirc`) that aren't on PATH.
         #[arg(long)]
         bin: Option<PathBuf>,
+        /// Also install media.pl (/mediashow, /mediasave, /medialist) into autorun.
+        #[arg(long)]
+        media: bool,
     },
     /// Log in: password + SAS emoji verify. `--token` for access-token mode.
     Login {
@@ -222,7 +226,12 @@ pub fn reset(force: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn install_irssi(force: bool, dry_run: bool, bin: Option<PathBuf>) -> Result<()> {
+pub fn install_irssi(
+    force: bool,
+    dry_run: bool,
+    bin: Option<PathBuf>,
+    media: bool,
+) -> Result<()> {
     // Bare `matrirc` resolves via $PATH at runtime, so the script survives
     // brew upgrades or the binary moving.
     let script = match bin {
@@ -235,17 +244,32 @@ pub fn install_irssi(force: bool, dry_run: bool, bin: Option<PathBuf>) -> Result
 
     if dry_run {
         print!("{script}");
+        if media {
+            println!("\n--- matrirc-media.pl ---");
+            print!("{MEDIA_SCRIPT}");
+        }
         return Ok(());
     }
 
-    let (script_path, autorun_link) = irssi_paths()?;
+    install_pl("matrirc.pl", &script, force)?;
+    println!("now: /script load matrirc");
+
+    if media {
+        install_pl("matrirc-media.pl", MEDIA_SCRIPT, force)?;
+        println!("now: /script load matrirc-media");
+    }
+    Ok(())
+}
+
+fn install_pl(name: &str, contents: &str, force: bool) -> Result<()> {
+    let (script_path, autorun_link) = irssi_paths_for(name)?;
     if script_path.exists() && !force {
         return Err(anyhow!("{} exists; use --force", script_path.display()));
     }
     if let Some(d) = script_path.parent() {
         std::fs::create_dir_all(d).context("create scripts dir")?;
     }
-    std::fs::write(&script_path, script).context("write script")?;
+    std::fs::write(&script_path, contents).context("write script")?;
     println!("installed {}", script_path.display());
 
     if let Some(d) = autorun_link.parent() {
@@ -257,9 +281,8 @@ pub fn install_irssi(force: bool, dry_run: bool, bin: Option<PathBuf>) -> Result
         }
         std::fs::remove_file(&autorun_link).context("remove autorun symlink")?;
     }
-    std::os::unix::fs::symlink("../matrirc.pl", &autorun_link).context("symlink autorun")?;
-    println!("symlinked {} → ../matrirc.pl", autorun_link.display());
-    println!("now: /script load matrirc");
+    std::os::unix::fs::symlink(format!("../{name}"), &autorun_link).context("symlink autorun")?;
+    println!("symlinked {} → ../{name}", autorun_link.display());
     Ok(())
 }
 
@@ -270,11 +293,11 @@ fn render_from_str(bin: &str) -> Result<String> {
     Ok(PERL_TEMPLATE.replace("__MATRIRC_BIN__", bin))
 }
 
-fn irssi_paths() -> Result<(PathBuf, PathBuf)> {
+fn irssi_paths_for(name: &str) -> Result<(PathBuf, PathBuf)> {
     let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME not set"))?;
     let scripts = PathBuf::from(home).join(".irssi").join("scripts");
-    let script = scripts.join("matrirc.pl");
-    let autorun = scripts.join("autorun").join("matrirc.pl");
+    let script = scripts.join(name);
+    let autorun = scripts.join("autorun").join(name);
     Ok((script, autorun))
 }
 
