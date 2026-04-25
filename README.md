@@ -79,12 +79,17 @@ Commands (run from a channel or query window — that's the scope):
 /mediashow [N|name|nick]            fetch + open via $MATRIRC_IMG_OPEN
 /mediasave [N|name|nick] [dir]      fetch + save (default ~/Downloads)
 /medialist [all]                    history; `all` for cross-channel
+/mediasend <path> [caption]         upload a local file to the active room
 ```
 
 `N` is an index into the current scope's history. A bare nick
 (`/mediashow alice`) returns that user's most recent attachment;
 a substring (`/mediashow screenshot`) matches the filename. Prefix
 with `#channel` to override scope (`/mediashow #room 3`).
+
+`/mediasend` always targets the active window; the path argument
+tab-completes. Daemon caps uploads at 100 MiB; bigger files come
+back as HTTP 413.
 
 ## Commands
 
