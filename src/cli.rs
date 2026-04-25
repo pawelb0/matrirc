@@ -74,6 +74,20 @@ pub async fn login(
     use_token: bool,
     skip_verify: bool,
 ) -> Result<()> {
+    let cfg_path = config_path()?;
+    if cfg_path.exists() {
+        return Err(anyhow!("config at {}; `matrirc reset` first", cfg_path.display()));
+    }
+    let store = matrix::store_path()?;
+    let stale = store.is_dir()
+        && std::fs::read_dir(&store).map(|mut it| it.next().is_some()).unwrap_or(false);
+    if stale {
+        return Err(anyhow!(
+            "crypto store at {} pins to a prior device id; `matrirc reset` first",
+            store.display()
+        ));
+    }
+
     let server_name = matrix::server_name_from_mxid(mxid)?;
     let http = reqwest::Client::builder()
         .user_agent(concat!("matrirc/", env!("CARGO_PKG_VERSION")))
@@ -92,10 +106,9 @@ pub async fn login(
         matrix::login_with_password(&homeserver_url, mxid, &password).await?
     };
 
-    let path = config_path()?;
-    cfg.save(&path)?;
+    cfg.save(&cfg_path)?;
     println!("✓ {} (device {}) on {}", cfg.mxid, cfg.device_id, cfg.homeserver_url);
-    println!("  config: {}", path.display());
+    println!("  config: {}", cfg_path.display());
 
     if skip_verify {
         println!("\n--skip-verify: E2EE rooms won't decrypt until `matrirc verify` or bootstrap-e2ee.");
