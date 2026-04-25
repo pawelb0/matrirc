@@ -210,7 +210,7 @@ impl Bridge {
     pub fn dm_room_for(&self, target: &str) -> Option<OwnedRoomId> {
         let m = self.mapping.read().unwrap();
         m.nick_to_dm_room.get(&target.to_ascii_lowercase()).cloned()
-            // bare `kkrolikowski:server` form (irssi /query strips leading '@')
+            // irssi /query strips the leading '@' — accept bare `name:server` too.
             .or_else(|| m.nick_to_dm_room.get(&format!("@{target}").to_ascii_lowercase()).cloned())
     }
 
@@ -326,8 +326,8 @@ mod tests {
     fn insert_dm_resolves_every_alias() {
         let mut m = Mapping::default();
         let r = RoomId::parse("!xyz:server.org").unwrap();
-        m.insert_dm(r.clone(), "Phobos", &["@kkrolikowski:server.org", "kkrolikowski"]);
-        for key in ["phobos", "Phobos", "PHOBOS", "kkrolikowski", "KKrolikowski", "@kkrolikowski:server.org"] {
+        m.insert_dm(r.clone(), "Alice", &["@alice:server.org", "alice"]);
+        for key in ["alice", "Alice", "ALICE", "@alice:server.org", "@ALICE:server.org"] {
             let hit = m.nick_to_dm_room.get(&key.to_ascii_lowercase());
             assert_eq!(hit, Some(&r), "alias {key:?} should resolve");
         }
@@ -339,11 +339,11 @@ mod tests {
         let r = RoomId::parse("!xyz:server.org").unwrap();
         {
             let mut m = b.mapping.write().unwrap();
-            m.insert_dm(r.clone(), "phobos", &["@kkrolikowski:server.org"]);
+            m.insert_dm(r.clone(), "alice", &["@alice:server.org"]);
         }
-        assert_eq!(b.dm_room_for("@kkrolikowski:server.org"), Some(r.clone()));
-        // irssi strips leading '@' when /query — accept bare form too
-        assert_eq!(b.dm_room_for("kkrolikowski:server.org"), Some(r));
+        assert_eq!(b.dm_room_for("@alice:server.org"), Some(r.clone()));
+        // irssi strips '@' on /query; bare form must still resolve.
+        assert_eq!(b.dm_room_for("alice:server.org"), Some(r));
     }
 
     #[test]
