@@ -4,7 +4,7 @@ use Irssi;
 use Time::Local qw(timegm);
 use vars qw($VERSION %IRSSI);
 
-$VERSION = '0.5.0';
+$VERSION = '0.6.0';
 %IRSSI = (
     authors     => 'matrirc',
     name        => 'matrirc-media',
@@ -57,6 +57,23 @@ sub safe_name {
     $s =~ s/^\s+|\s+$//g;
     $s = substr($s, 0, 120);
     return $s;
+}
+
+sub urlencode {
+    my $s = shift // '';
+    $s =~ s/([^A-Za-z0-9._~-])/sprintf('%%%02X', ord($1))/ge;
+    return $s;
+}
+
+sub origin_for {
+    my ($servtag, $target) = @_;
+    return undef unless defined $servtag && defined $target;
+    my $server = Irssi::server_find_tag($servtag);
+    return undef unless $server;
+    my $item = ($target =~ /^[#&!+]/) ? $server->channel_find($target)
+                                      : $server->query_find($target);
+    return undef unless $item;
+    return $item->can('window') ? $item->window : $item;
 }
 
 sub print_to_origin {
@@ -214,10 +231,71 @@ sub fetch_async {
     Irssi::pidwait_add($pid);
 }
 
+sub fork_curl_post {
+    my (%args) = @_;
+    my $url   = $args{url};
+    my $path  = $args{path};
+    my $witem = $args{witem};
+
+    my $stamp = time . '-' . $$ . '-' . int(rand(1_000_000));
+    my $out   = "$TMP_DIR/upload-$stamp.out";
+
+    my $pid = fork();
+    if (!defined $pid) {
+        Irssi::print("matrirc media: fork failed: $!");
+        return;
+    }
+    if ($pid == 0) {
+        open(STDIN,  '<', '/dev/null');
+        open(STDOUT, '>', $out);
+        open(STDERR, '>>', $out);
+        exec($CURL, '--max-time', '120', '-sS', '-X', 'POST',
+             '--data-binary', "\@$path",
+             '-H', 'Content-Type: application/octet-stream',
+             '-w', "\n%{http_code}\n",
+             $url) or exit 9;
+    }
+
+    $pending{$pid} = {
+        kind    => 'upload',
+        out     => $out,
+        path    => $path,
+        servtag => $witem ? $witem->{server}{tag} : undef,
+        target  => $witem ? $witem->{name} : undef,
+    };
+    Irssi::pidwait_add($pid);
+}
+
 Irssi::signal_add('pidwait' => sub {
     my ($pid, $status) = @_;
     my $job = delete $pending{$pid};
     return unless $job;
+
+    if (($job->{kind} // '') eq 'upload') {
+        my $body = '';
+        if (open(my $fh, '<', $job->{out})) {
+            local $/; $body = <$fh>; close $fh;
+        }
+        unlink $job->{out};
+
+        my @lines = split /\n/, ($body // '');
+        while (@lines && $lines[-1] eq '') { pop @lines; }
+        my $code = '';
+        if (@lines && $lines[-1] =~ /^\d{3}$/) { $code = pop @lines; }
+        my $msg_body = join("\n", @lines);
+
+        my $where = origin_for($job->{servtag}, $job->{target});
+        if ($code eq '200') {
+            return; # silent — sync echo paints the line
+        }
+        my $line = ($code =~ /^\d{3}$/)
+            ? "mediasend: HTTP $code: $msg_body"
+            : "mediasend: upload failed (curl exit "
+              . ($status >> 8) . "): $msg_body";
+        if ($where) { $where->print($line, Irssi::MSGLEVEL_CLIENTCRAP); }
+        else        { Irssi::print($line); }
+        return;
+    }
 
     if (!-s $job->{tmp}) {
         unlink $job->{tmp};
@@ -331,9 +409,43 @@ sub cmd_medialist {
     }
 }
 
+sub cmd_mediasend {
+    my ($args, $server, $witem) = @_;
+    if (!$witem || !defined $witem->{name} || $witem->{name} eq '') {
+        Irssi::print("mediasend: open a channel/query first");
+        return;
+    }
+    $args //= '';
+    $args =~ s/^\s+//;
+    my ($path, $caption) = split /\s+/, $args, 2;
+    if (!defined $path || $path eq '') {
+        Irssi::print("mediasend: usage: /mediasend <path> [caption]");
+        return;
+    }
+    $path =~ s{^~}{$ENV{HOME}};
+    if (!-f $path) {
+        Irssi::print("mediasend: no such file: $path");
+        return;
+    }
+
+    my $base = $path;
+    $base =~ s{^.*/}{};
+
+    my $url = sprintf('http://127.0.0.1:6680/upload/%s?filename=%s',
+                      urlencode($witem->{name}),
+                      urlencode($base));
+    if (defined $caption && length $caption) {
+        $url .= '&caption=' . urlencode($caption);
+    }
+
+    fork_curl_post(url => $url, path => $path, witem => $witem);
+    Irssi::print("mediasend: uploading $base → $witem->{name}");
+}
+
 Irssi::signal_add('event privmsg' => \&on_privmsg_event);
 Irssi::command_bind('mediashow' => \&cmd_mediashow);
 Irssi::command_bind('mediasave' => \&cmd_mediasave);
 Irssi::command_bind('medialist' => \&cmd_medialist);
+Irssi::command_bind('mediasend' => \&cmd_mediasend);
 
-Irssi::print("matrirc-media $VERSION loaded; /mediashow [N|name], /mediasave, /medialist");
+Irssi::print("matrirc-media $VERSION loaded; /mediashow, /mediasave, /medialist, /mediasend");
