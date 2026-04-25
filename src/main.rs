@@ -37,18 +37,12 @@ async fn run() -> Result<()> {
 
     let _pid_guard = daemon::claim()?;
 
-    let override_pair = bridge::env_override();
+    let env_override_room = bridge::env_override();
     let (bridge_state, to_matrix_rx) = bridge::Bridge::new(bridge::Mapping::default());
-    let env_override_room = match override_pair {
-        Some((room, chan)) => {
-            tracing::info!("bridge: MATRIRC_ROOM override active, only bridging {room} as {chan}");
-            Some(room)
-        }
-        None => {
-            tracing::info!("bridge: auto-discovering all Joined rooms after sync");
-            None
-        }
-    };
+    match &env_override_room {
+        Some(room) => tracing::info!("bridge: MATRIRC_ROOM set, only bridging {room}"),
+        None => tracing::info!("bridge: auto-discovering all Joined rooms after sync"),
+    }
 
     let store_path = names::default_store_path()?;
     let name_store = Arc::new(names::NameStore::load(store_path)?);

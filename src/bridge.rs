@@ -39,12 +39,12 @@ impl Mapping {
     }
 }
 
-/// If MATRIRC_ROOM is set, returns a one-entry override mapping for dev. Else None,
-/// meaning the caller should auto-discover rooms after sync.
-pub fn env_override() -> Option<(OwnedRoomId, &'static str)> {
+/// If MATRIRC_ROOM is set, returns the one room to bridge (dev-only). Otherwise
+/// None — caller auto-discovers all joined rooms after sync.
+pub fn env_override() -> Option<OwnedRoomId> {
     let s = std::env::var("MATRIRC_ROOM").ok().filter(|s| !s.is_empty())?;
     match RoomId::parse(&s) {
-        Ok(room) => Some((room, "#matrix")),
+        Ok(room) => Some(room),
         Err(e) => {
             tracing::warn!("MATRIRC_ROOM not a valid room id ({s}): {e}");
             None
