@@ -64,10 +64,12 @@ matrirc reset --force              wipe local state
 matrirc install-irssi              drop irssi script
 ```
 
-Once connected, `/msg matrirc help` prints the full command reference
-from inside irssi. `/msg matrirc search <term>` queries the public-room
-directory; `/join #alias:server.org` joins any public Matrix room.
-`/msg @alice:server.org hi` opens or creates a DM.
+Once connected, from inside irssi:
+
+- `/msg matrirc help` — full command reference
+- `/msg matrirc search <term>` — public-room directory search
+- `/join #alias:server.org` — join any public Matrix room
+- `/msg @alice:server.org hi` — open or create a DM
 
 ## How it works
 
@@ -115,13 +117,13 @@ Password login gives you a fresh, unverified device. SAS emoji
 verification cross-signs it. After that other clients share megolm
 room keys with you.
 
-Historic messages need the server-side key backup. If Element set one
-up, the backup key rides along with SAS. If not, old messages stay
-encrypted. `matrirc verify` prints the current state.
+Historic messages need the server-side key backup. SAS pulls the
+backup key with it when Element has one set up; otherwise old messages
+stay encrypted. `matrirc verify` prints the current state.
 
 Recovery-key path: `matrirc bootstrap-e2ee` reads
 `MATRIRC_RECOVERY_KEY` (or stdin), opens SSS, pulls cross-signing +
-backup directly. Not stored anywhere.
+backup directly. The key is not stored anywhere.
 
 ## Naming
 
@@ -152,7 +154,7 @@ cargo build --release
 cargo test
 ```
 
-Rust 1.95+. First build pulls matrix-sdk, takes a few minutes.
+Rust 1.95+. First build takes a few minutes.
 
 ## Caveats
 
