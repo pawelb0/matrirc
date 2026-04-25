@@ -208,6 +208,17 @@ impl Bridge {
         let _ = self.from_matrix.send(FromMatrix::DmAdded { nick });
     }
 
+    // used by the proxy upload handler
+    #[allow(dead_code)]
+    pub fn resolve_scope(&self, name: &str) -> Option<OwnedRoomId> {
+        let m = self.mapping.read().unwrap();
+        if name.starts_with(['#', '&', '!', '+']) {
+            m.chan_to_room.get(name).cloned()
+        } else {
+            m.nick_to_dm_room.get(&name.to_ascii_lowercase()).cloned()
+        }
+    }
+
     pub fn chan_for(&self, room: &RoomId) -> Option<String> {
         self.mapping.read().unwrap().room_to_chan.get(room).cloned()
     }
@@ -386,6 +397,22 @@ mod tests {
         b.note_sent_by_us(id.clone());
         assert!(b.take_if_sent_by_us(&id));
         assert!(!b.take_if_sent_by_us(&id), "second call should be false (consumed)");
+    }
+
+    #[test]
+    fn resolve_scope_finds_channel_and_dm() {
+        let mut m = Mapping::default();
+        let chan_room: OwnedRoomId = RoomId::parse("!chan:example.org").unwrap();
+        let dm_room: OwnedRoomId = RoomId::parse("!dm:example.org").unwrap();
+        m.insert(chan_room.clone(), "#room-abc", "topic");
+        m.insert_dm(dm_room.clone(), "Alice", &["@alice:example.org", "alice"]);
+        let (b, _rx) = Bridge::new(m);
+
+        assert_eq!(b.resolve_scope("#room-abc"), Some(chan_room));
+        assert_eq!(b.resolve_scope("alice"), Some(dm_room.clone()));
+        assert_eq!(b.resolve_scope("ALICE"), Some(dm_room));
+        assert_eq!(b.resolve_scope("#nope"), None);
+        assert_eq!(b.resolve_scope("nobody"), None);
     }
 
     #[test]
