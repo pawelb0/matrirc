@@ -4,10 +4,24 @@ Local IRC server backed by Matrix. Point irssi/weechat/hexchat at
 `127.0.0.1:6667` and talk to your Matrix rooms + DMs from there. E2EE
 included.
 
-## Quick start
+## Install
+
+Homebrew:
+
+```
+brew tap pawelb0/tap
+brew install matrirc
+```
+
+From source:
 
 ```
 cargo install --path .
+```
+
+## Quick start
+
+```
 matrirc login @you:homeserver.org
 matrirc run
 ```
