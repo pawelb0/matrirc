@@ -68,6 +68,62 @@ pub async fn run_proxy(addr: SocketAddr, client: Client, index: Arc<AttachIndex>
     }
 }
 
+// used by the upload handler
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct UploadRequest {
+    pub scope: String,
+    pub filename: String,
+    pub caption: Option<String>,
+    pub content_length: usize,
+}
+
+// used by the upload handler
+#[allow(dead_code)]
+pub(crate) fn parse_upload_request(head: &str) -> Result<UploadRequest, &'static str> {
+    let mut lines = head.lines();
+    let request_line = lines.next().ok_or("empty request")?;
+    let mut parts = request_line.split_whitespace();
+    let _method = parts.next().ok_or("no method")?;
+    let path_and_query = parts.next().ok_or("no path")?;
+
+    let raw_path = path_and_query
+        .strip_prefix("/upload/")
+        .ok_or("not an upload path")?;
+    let (encoded_scope, query) = match raw_path.split_once('?') {
+        Some((p, q)) => (p, q),
+        None => (raw_path, ""),
+    };
+    let scope = percent_decode(encoded_scope);
+    if scope.is_empty() {
+        return Err("empty scope");
+    }
+
+    let mut filename: Option<String> = None;
+    let mut caption: Option<String> = None;
+    for pair in query.split('&').filter(|p| !p.is_empty()) {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        match k {
+            "filename" => filename = Some(percent_decode(v)),
+            "caption" => caption = Some(percent_decode(v)),
+            _ => {}
+        }
+    }
+    let filename = filename.filter(|s| !s.is_empty()).ok_or("missing filename")?;
+
+    let mut content_length: Option<usize> = None;
+    for line in lines {
+        let line = line.trim_end_matches('\r');
+        let Some((k, v)) = line.split_once(':') else { continue };
+        if k.eq_ignore_ascii_case("content-length") {
+            content_length = v.trim().parse().ok();
+        }
+    }
+    let content_length = content_length.ok_or("missing content-length")?;
+
+    Ok(UploadRequest { scope, filename, caption, content_length })
+}
+
 async fn handle(mut sock: TcpStream, client: Client, index: Arc<AttachIndex>) -> Result<()> {
     let mut buf = vec![0u8; MAX_REQ_BYTES];
     let mut total = 0;
@@ -171,6 +227,43 @@ mod tests {
         assert_eq!(percent_decode("foo"), "foo");
         assert_eq!(percent_decode("%24abc%3Aserver"), "$abc:server");
         assert_eq!(percent_decode("%2"), "%2");
+    }
+
+    #[test]
+    fn parse_upload_request_basic() {
+        let head = "POST /upload/%23room-abc?filename=cat.png&caption=Look%21 HTTP/1.1\r\n\
+                    Host: 127.0.0.1:6680\r\n\
+                    Content-Length: 12345\r\n\
+                    Content-Type: application/octet-stream\r\n\r\n";
+        let req = parse_upload_request(head).unwrap();
+        assert_eq!(req.scope, "#room-abc");
+        assert_eq!(req.filename, "cat.png");
+        assert_eq!(req.caption.as_deref(), Some("Look!"));
+        assert_eq!(req.content_length, 12345);
+    }
+
+    #[test]
+    fn parse_upload_request_no_caption() {
+        let head = "POST /upload/peer?filename=foo.bin HTTP/1.1\r\n\
+                    Content-Length: 7\r\n\r\n";
+        let req = parse_upload_request(head).unwrap();
+        assert_eq!(req.scope, "peer");
+        assert_eq!(req.filename, "foo.bin");
+        assert!(req.caption.is_none());
+        assert_eq!(req.content_length, 7);
+    }
+
+    #[test]
+    fn parse_upload_request_rejects_missing_filename() {
+        let head = "POST /upload/peer HTTP/1.1\r\n\
+                    Content-Length: 1\r\n\r\n";
+        assert!(parse_upload_request(head).is_err());
+    }
+
+    #[test]
+    fn parse_upload_request_rejects_missing_length() {
+        let head = "POST /upload/peer?filename=x HTTP/1.1\r\n\r\n";
+        assert!(parse_upload_request(head).is_err());
     }
 
     #[test]
