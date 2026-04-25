@@ -82,7 +82,7 @@ Commands (run from a channel or query window — that's the scope):
 ```
 
 `N` is an index into the current scope's history. A bare nick
-(`/mediashow phobos`) returns that user's most recent attachment;
+(`/mediashow alice`) returns that user's most recent attachment;
 a substring (`/mediashow screenshot`) matches the filename. Prefix
 with `#channel` to override scope (`/mediashow #room 3`).
 
