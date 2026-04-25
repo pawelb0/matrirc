@@ -452,8 +452,9 @@ async fn auto_join_all(
     for (chan, room) in &channels {
         if s.joined.contains(chan) { continue; }
         let topic = bridge.topic_for(chan).unwrap_or_default();
-        // Fast preamble with placeholder NAMES; proper member list comes with backfill.
-        send_join(write, nick, chan, &topic, &["matrix"]).await?;
+        let members = fetch_members(bridge, room).await;
+        let member_refs: Vec<&str> = members.iter().map(String::as_str).collect();
+        send_join(write, nick, chan, &topic, &member_refs).await?;
         s.joined.insert(chan.clone());
         new_joins.push((chan.clone(), room.clone()));
     }
@@ -1274,5 +1275,32 @@ mod tests {
         ).await;
         assert!(out.contains("PRIVMSG #room-a one\r\n"));
         assert!(out.contains("PRIVMSG #room-a two\r\n"));
+    }
+
+    #[tokio::test]
+    async fn auto_join_sends_real_members_in_names() {
+        use crate::bridge::ToMatrix;
+        let (b, mut rx) = Bridge::new(Mapping::default());
+        let r = room("!a:server");
+        b.add_mapping(r.clone(), "#room-a".into(), "topic".into());
+
+        tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                if let ToMatrix::Members { reply, .. } = msg {
+                    let _ = reply.send(vec!["alice".into(), "bob".into()]);
+                }
+            }
+        });
+
+        let mut s = State::default();
+        s.nick = Some("pawelb".into());
+        s.user = Some("pawelb".into());
+
+        let mut out = Vec::<u8>::new();
+        auto_join_all(&mut out, "pawelb", &b, &mut s).await.unwrap();
+        let out = String::from_utf8(out).unwrap();
+
+        assert!(out.contains("353 pawelb = #room-a :alice bob pawelb"), "names: {out}");
+        assert!(!out.contains(":matrix pawelb"), "placeholder leaked: {out}");
     }
 }
