@@ -88,11 +88,26 @@ async fn run() -> Result<()> {
 #[cfg(unix)]
 async fn wait_for_signal() {
     use tokio::signal::unix::{signal, SignalKind};
-    let mut term = match signal(SignalKind::terminate()) { Ok(s) => s, Err(_) => return };
-    let mut int = match signal(SignalKind::interrupt()) { Ok(s) => s, Err(_) => return };
-    tokio::select! {
-        _ = term.recv() => {},
-        _ = int.recv() => {},
+    // Failing to install either handler would let the daemon exit immediately
+    // on shutdown — fall back to ctrl_c so SIGINT still works.
+    let term = signal(SignalKind::terminate());
+    let int = signal(SignalKind::interrupt());
+    match (term, int) {
+        (Ok(mut term), Ok(mut int)) => {
+            tokio::select! {
+                _ = term.recv() => {},
+                _ = int.recv() => {},
+            }
+        }
+        (term, int) => {
+            if let Err(e) = &term {
+                tracing::warn!("install SIGTERM handler failed: {e}");
+            }
+            if let Err(e) = &int {
+                tracing::warn!("install SIGINT handler failed: {e}");
+            }
+            let _ = tokio::signal::ctrl_c().await;
+        }
     }
 }
 
