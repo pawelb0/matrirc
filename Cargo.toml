@@ -1,22 +1,36 @@
 [package]
 name = "matrirc"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2021"
 description = "Local IRC server that bridges to a Matrix homeserver"
 license = "GPL-3.0-or-later"
 
 [dependencies]
-tokio = { version = "1", features = ["net", "io-util", "rt-multi-thread", "macros", "sync", "signal"] }
+tokio = { version = "1", features = [
+  "net",
+  "io-util",
+  "rt-multi-thread",
+  "macros",
+  "sync",
+  "signal",
+] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+reqwest = { version = "0.12", default-features = false, features = [
+  "rustls-tls",
+  "json",
+] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
-matrix-sdk = { version = "=0.14", default-features = false, features = ["rustls-tls", "sqlite", "e2e-encryption"] }
+matrix-sdk = { version = "=0.14", default-features = false, features = [
+  "rustls-tls",
+  "sqlite",
+  "e2e-encryption",
+] }
 mime_guess = "2"
 time = { version = "0.3", features = ["formatting", "macros"] }
 libc = "0.2"
