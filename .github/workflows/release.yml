@@ -1,0 +1,88 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - matrirc-*
+  # Manual trigger for dry-runs: builds + uploads artifacts to the
+  # workflow run but skips the create-release job.
+  workflow_dispatch:
+
+jobs:
+  build-binaries:
+    runs-on: "${{ matrix.os }}"
+    needs: build-manpage
+    permissions:
+      id-token: write
+      contents: read
+      attestations: write
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+      - run: cargo build --locked --target '${{ matrix.target }}' --release
+      - run: strip 'target/${{ matrix.target }}/release/matrirc'
+        if: ${{ !contains(matrix.target, 'windows') }}
+      - id: version
+        shell: bash
+        run: |
+          echo "version=$(cargo pkgid | cut -d'#' -f2 | cut -d: -f2)" >>"${GITHUB_OUTPUT}"
+      - id: package
+        shell: bash
+        run: ./scripts/package '${{ steps.version.outputs.version }}' '${{ matrix.target }}'
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ steps.package.outputs.file }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: ${{ steps.package.outputs.file }}
+
+  create-release:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    needs: build-binaries
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+      - run: mkdir ./assets
+      - run: mv ./artifacts/*/*.{zip,tar.gz} ./assets
+      - run: b2sum *.{zip,tar.gz} > B2SUMS.txt
+        working-directory: assets
+      - id: version
+        shell: bash
+        run: |
+          echo "version=$(cargo pkgid | cut -d'#' -f2 | cut -d: -f2)" >>"${GITHUB_OUTPUT}"
+      - name: Extract changelog
+        shell: bash
+        run: |
+          awk -v r='${{ steps.version.outputs.version }}' \
+            '/^\[[^]]*\]/{print $0}/^## \[[0-9]/ && match($0, /\[[0-9][^]]*\]/){if (r == substr($0, RSTART+1, RLENGTH-2)) { p=1; next } else { p=0 } }p' \
+            CHANGELOG.md > ./CHANGELOG-release.md
+          cat CHANGELOG-release.md
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: matrirc-${{ steps.version.outputs.version }}
+          body_path: ./CHANGELOG-release.md
+          files: "./assets/*"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
