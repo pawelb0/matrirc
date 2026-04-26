@@ -4,7 +4,7 @@ use Irssi;
 use Time::Local qw(timegm);
 use vars qw($VERSION %IRSSI);
 
-$VERSION = '0.6.0';
+$VERSION = '0.7.0';
 %IRSSI = (
     authors     => 'matrirc',
     name        => 'matrirc-media',
@@ -198,6 +198,54 @@ sub parse_iso {
 # Async-fetch the picked attachment to a final filesystem path. After fetch,
 # call $on_done->($info, $final_path) (in parent) via pidwait.
 my %pending;
+my $upload_timer;
+
+sub upload_jobs_count {
+    return scalar grep { ($_->{kind} // '') eq 'upload' } values %pending;
+}
+
+sub upload_status_item {
+    my ($item, $get_size_only) = @_;
+    my @uploads = grep { ($_->{kind} // '') eq 'upload' } values %pending;
+    my $text = '';
+    if (@uploads) {
+        my $now    = time;
+        my $oldest = $now;
+        for my $u (@uploads) {
+            my $t = $u->{started_at} // $now;
+            $oldest = $t if $t < $oldest;
+        }
+        my $secs = $now - $oldest;
+        if (@uploads == 1) {
+            my $name = $uploads[0]{path} // '';
+            $name =~ s{^.*/}{};
+            $text = "{sb up: $name ${secs}s}";
+        } else {
+            $text = "{sb up: " . scalar(@uploads) . " files ${secs}s}";
+        }
+    }
+    $item->default_handler($get_size_only, $text, undef, 1);
+}
+
+sub upload_tick {
+    Irssi::statusbar_items_redraw('matrirc_upload');
+    if (upload_jobs_count() == 0 && defined $upload_timer) {
+        Irssi::timeout_remove($upload_timer);
+        $upload_timer = undef;
+    }
+}
+
+sub upload_timer_start {
+    return if defined $upload_timer;
+    $upload_timer = Irssi::timeout_add(1000, \&upload_tick, undef);
+}
+
+sub upload_timer_stop_if_idle {
+    return unless defined $upload_timer;
+    return if upload_jobs_count() > 0;
+    Irssi::timeout_remove($upload_timer);
+    $upload_timer = undef;
+}
 
 sub fetch_async {
     my (%args) = @_;
@@ -259,13 +307,16 @@ sub fork_curl_post {
     }
 
     $pending{$pid} = {
-        kind    => 'upload',
-        out     => $out,
-        path    => $path,
-        servtag => $witem ? $witem->{server}{tag} : undef,
-        target  => $witem ? $witem->{name} : undef,
+        kind       => 'upload',
+        out        => $out,
+        path       => $path,
+        started_at => time,
+        servtag    => $witem ? $witem->{server}{tag} : undef,
+        target     => $witem ? $witem->{name} : undef,
     };
     Irssi::pidwait_add($pid);
+    upload_timer_start();
+    Irssi::statusbar_items_redraw('matrirc_upload');
 }
 
 Irssi::signal_add('pidwait' => sub {
@@ -288,6 +339,8 @@ Irssi::signal_add('pidwait' => sub {
 
         my $where = origin_for($job->{servtag}, $job->{target});
         if ($code eq '200') {
+            upload_timer_stop_if_idle();
+            Irssi::statusbar_items_redraw('matrirc_upload');
             return; # silent — sync echo paints the line
         }
         my $line = ($code =~ /^\d{3}$/)
@@ -296,6 +349,8 @@ Irssi::signal_add('pidwait' => sub {
               . ($status >> 8) . "): $msg_body";
         if ($where) { $where->print($line, Irssi::MSGLEVEL_CLIENTCRAP); }
         else        { Irssi::print($line); }
+        upload_timer_stop_if_idle();
+        Irssi::statusbar_items_redraw('matrirc_upload');
         return;
     }
 
@@ -467,4 +522,7 @@ Irssi::signal_add_first('complete word', sub {
     Irssi::signal_stop();
 });
 
+Irssi::statusbar_item_register('matrirc_upload', undef, 'upload_status_item');
+
 Irssi::print("matrirc-media $VERSION loaded; /mediashow, /mediasave, /medialist, /mediasend");
+Irssi::print("upload statusbar: /statusbar window add matrirc_upload  (one-time)");

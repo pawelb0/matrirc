@@ -90,6 +90,7 @@ with `#channel` to override scope (`/mediashow #room 3`).
 `/mediasend` always targets the active window; the path argument
 tab-completes. Daemon caps uploads at 100 MiB; bigger files come
 back as HTTP 413. Honors `MATRIRC_ATTACH_BIND` if set.
+Run `/statusbar window add matrirc_upload` once for an in-flight indicator.
 
 ## Commands
 
