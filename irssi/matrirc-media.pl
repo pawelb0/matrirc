@@ -67,6 +67,25 @@ sub urlencode {
     return $s;
 }
 
+# Pulls (path, rest) out of /mediasend's args. Supports `"…"` and `'…'`
+# quoting so paths with spaces work; backslash-escapes inside `"…"` survive.
+sub split_path_arg {
+    my ($args) = @_;
+    $args //= '';
+    $args =~ s/^\s+//;
+    return ('', '') if $args eq '';
+    if ($args =~ /^"((?:[^"\\]|\\.)*)"\s*(.*)$/s) {
+        my ($path, $rest) = ($1, $2);
+        $path =~ s/\\(.)/$1/g;
+        return ($path, $rest);
+    }
+    if ($args =~ /^'([^']*)'\s*(.*)$/s) {
+        return ($1, $2);
+    }
+    my ($path, $rest) = split /\s+/, $args, 2;
+    return ($path // '', $rest // '');
+}
+
 sub origin_for {
     my ($servtag, $target) = @_;
     return undef unless defined $servtag && defined $target;
@@ -474,7 +493,7 @@ sub cmd_mediasend {
     }
     $args //= '';
     $args =~ s/^\s+//;
-    my ($path, $caption) = split /\s+/, $args, 2;
+    my ($path, $caption) = split_path_arg($args);
     if (!defined $path || $path eq '') {
         Irssi::print("mediasend: usage: /mediasend <path> [caption]");
         return;
@@ -517,6 +536,10 @@ Irssi::signal_add_first('complete word', sub {
     for my $m (@matches) {
         if ($had_tilde) { $m =~ s{^\Q$ENV{HOME}\E}{~}; }
         if (-d $m) { $m .= '/'; }
+        if ($m =~ / /) {
+            $m =~ s/(["\\])/\\$1/g;
+            $m = qq{"$m"};
+        }
         push @$complist, $m;
     }
     Irssi::signal_stop();
