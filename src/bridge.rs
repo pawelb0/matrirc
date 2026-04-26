@@ -23,6 +23,16 @@ impl Mapping {
         self.room_to_chan.insert(room, chan);
     }
 
+    /// Adds a secondary lookup key for `room` (e.g. canonical alias). The slug
+    /// stored in `room_to_chan` is unchanged. Empty / blank aliases are ignored.
+    pub fn register_alias(&mut self, alias: &str, room: OwnedRoomId) {
+        let key = alias.trim().to_ascii_lowercase();
+        if key.is_empty() {
+            return;
+        }
+        self.chan_to_room.insert(key, room);
+    }
+
     pub fn set_topic(&mut self, chan: &str, topic: String) {
         self.chan_to_topic.insert(chan.to_string(), topic);
     }
@@ -36,6 +46,23 @@ impl Mapping {
             }
         }
         self.dm_room_to_nick.insert(room, nick);
+    }
+
+    /// Removes the channel mapping (slug + every alias key + topic). Returns
+    /// the slug that was stored, if any.
+    pub fn remove(&mut self, room: &RoomId) -> Option<String> {
+        let chan = self.room_to_chan.remove(room)?;
+        self.chan_to_topic.remove(&chan);
+        self.chan_to_room.retain(|_, r| r.as_str() != room.as_str());
+        Some(chan)
+    }
+
+    /// Removes the DM mapping (canonical nick + every alias). Returns the
+    /// canonical nick if the room was a DM.
+    pub fn remove_dm(&mut self, room: &RoomId) -> Option<String> {
+        let nick = self.dm_room_to_nick.remove(room)?;
+        self.nick_to_dm_room.retain(|_, r| r.as_str() != room.as_str());
+        Some(nick)
     }
 }
 
@@ -83,6 +110,15 @@ pub enum FromMatrix {
         nick: String,
         reason: Option<String>,
     },
+    /// Bridge mapping for `chan` was removed (own membership transitioned to
+    /// Leave / Kick / Ban). IRC layer should PART its joined buffer.
+    RoomRemoved {
+        chan: String,
+    },
+    /// DM mapping for `nick` was removed.
+    DmRemoved {
+        nick: String,
+    },
 }
 
 #[derive(Debug)]
@@ -127,6 +163,10 @@ pub enum ToMatrix {
     SetTopic {
         room: OwnedRoomId,
         topic: String,
+    },
+    LeaveRoom {
+        room: OwnedRoomId,
+        reply: oneshot::Sender<Result<(), String>>,
     },
 }
 
@@ -180,11 +220,36 @@ impl Bridge {
     }
 
     /// Adds the mapping + broadcasts RoomAdded so live IRC connections auto-join.
-    pub fn add_mapping(&self, room: OwnedRoomId, chan: String, topic: String) {
+    /// `aliases` are extra `chan_to_room` keys (typically the canonical alias and
+    /// alt aliases) so users can `/join #alias:server.org` and land on the slug.
+    pub fn add_mapping(&self, room: OwnedRoomId, chan: String, topic: String, aliases: &[&str]) {
         let mut m = self.mapping.write().unwrap();
         m.insert(room.clone(), chan.clone(), topic.clone());
+        for a in aliases {
+            m.register_alias(a, room.clone());
+        }
         drop(m);
         let _ = self.from_matrix.send(FromMatrix::RoomAdded { room, chan, topic });
+    }
+
+    /// Drops the channel mapping (slug + every alias key + topic) and broadcasts
+    /// `RoomRemoved`. No-op if the room is unknown.
+    pub fn remove_mapping(&self, room: &RoomId) -> Option<String> {
+        let mut m = self.mapping.write().unwrap();
+        let chan = m.remove(room)?;
+        drop(m);
+        let _ = self.from_matrix.send(FromMatrix::RoomRemoved { chan: chan.clone() });
+        Some(chan)
+    }
+
+    /// Drops the DM mapping (canonical nick + every alias) and broadcasts
+    /// `DmRemoved`. No-op if the room is not a DM.
+    pub fn remove_dm(&self, room: &RoomId) -> Option<String> {
+        let mut m = self.mapping.write().unwrap();
+        let nick = m.remove_dm(room)?;
+        drop(m);
+        let _ = self.from_matrix.send(FromMatrix::DmRemoved { nick: nick.clone() });
+        Some(nick)
     }
 
     pub fn update_topic(&self, room: &RoomId, topic: String) {
@@ -213,7 +278,9 @@ impl Bridge {
     pub fn resolve_scope(&self, name: &str) -> Option<OwnedRoomId> {
         let m = self.mapping.read().unwrap();
         if name.starts_with(['#', '&', '!', '+']) {
-            m.chan_to_room.get(name).cloned()
+            m.chan_to_room.get(name)
+                .or_else(|| m.chan_to_room.get(&name.to_ascii_lowercase()))
+                .cloned()
         } else {
             m.nick_to_dm_room.get(&name.to_ascii_lowercase()).cloned()
         }
@@ -235,7 +302,13 @@ impl Bridge {
     }
 
     pub fn room_for(&self, chan: &str) -> Option<OwnedRoomId> {
-        self.mapping.read().unwrap().chan_to_room.get(chan).cloned()
+        let m = self.mapping.read().unwrap();
+        // Slugs are stored lowercase and aliases are normalised on insert, so a
+        // case-insensitive lookup matches both. Try the raw key first to avoid
+        // allocating in the hot path.
+        m.chan_to_room.get(chan)
+            .or_else(|| m.chan_to_room.get(&chan.to_ascii_lowercase()))
+            .cloned()
     }
 
     pub fn has_room(&self, room: &RoomId) -> bool {
@@ -329,7 +402,7 @@ mod tests {
         let (b, _rx) = Bridge::new(Mapping::default());
         let mut sub = b.from_matrix.subscribe();
         let r = RoomId::parse("!abc:server.org").unwrap();
-        b.add_mapping(r.clone(), "#test-abc".into(), "topic".into());
+        b.add_mapping(r.clone(), "#test-abc".into(), "topic".into(), &[]);
         let ev = sub.try_recv().unwrap();
         match ev {
             FromMatrix::RoomAdded { room, chan, topic } => {
@@ -371,7 +444,7 @@ mod tests {
         let (b, _rx) = Bridge::new(Mapping::default());
         let mut sub = b.from_matrix.subscribe();
         let r = RoomId::parse("!abc:server.org").unwrap();
-        b.add_mapping(r.clone(), "#c".into(), "old".into());
+        b.add_mapping(r.clone(), "#c".into(), "old".into(), &[]);
         // drain RoomAdded
         let _ = sub.try_recv();
         b.update_topic(&r, "new topic".into());
@@ -413,6 +486,68 @@ mod tests {
         assert_eq!(b.resolve_scope("ALICE"), Some(dm_room));
         assert_eq!(b.resolve_scope("#nope"), None);
         assert_eq!(b.resolve_scope("nobody"), None);
+    }
+
+    #[test]
+    fn alias_keys_resolve_same_room() {
+        let (b, _rx) = Bridge::new(Mapping::default());
+        let r = RoomId::parse("!abc:server.org").unwrap();
+        b.add_mapping(
+            r.clone(),
+            "#room-abc".into(),
+            "topic".into(),
+            &["#public:server.org", "#legacy:server.org"],
+        );
+        // Slug + every alias resolves; alias lookup is case-insensitive.
+        assert_eq!(b.room_for("#room-abc"), Some(r.clone()));
+        assert_eq!(b.room_for("#public:server.org"), Some(r.clone()));
+        assert_eq!(b.room_for("#PUBLIC:server.org"), Some(r.clone()));
+        assert_eq!(b.room_for("#legacy:server.org"), Some(r));
+        // chan_for still returns the slug, not the alias.
+        assert_eq!(
+            b.chan_for(&RoomId::parse("!abc:server.org").unwrap()),
+            Some("#room-abc".into()),
+        );
+    }
+
+    #[test]
+    fn remove_mapping_clears_every_key_and_broadcasts() {
+        let (b, _rx) = Bridge::new(Mapping::default());
+        let mut sub = b.from_matrix.subscribe();
+        let r = RoomId::parse("!abc:server.org").unwrap();
+        b.add_mapping(r.clone(), "#room-abc".into(), "topic".into(), &["#alias:server.org"]);
+        let _ = sub.try_recv(); // RoomAdded
+        let removed = b.remove_mapping(&r).unwrap();
+        assert_eq!(removed, "#room-abc");
+        match sub.try_recv().unwrap() {
+            FromMatrix::RoomRemoved { chan } => assert_eq!(chan, "#room-abc"),
+            _ => panic!("expected RoomRemoved"),
+        }
+        assert_eq!(b.room_for("#room-abc"), None);
+        assert_eq!(b.room_for("#alias:server.org"), None);
+        assert_eq!(b.chan_for(&r), None);
+        assert_eq!(b.topic_for("#room-abc"), None);
+        // Second remove is a no-op.
+        assert!(b.remove_mapping(&r).is_none());
+    }
+
+    #[test]
+    fn remove_dm_clears_every_alias_and_broadcasts() {
+        let (b, _rx) = Bridge::new(Mapping::default());
+        let mut sub = b.from_matrix.subscribe();
+        let r = RoomId::parse("!dm:server.org").unwrap();
+        b.add_dm(r.clone(), "Alice".into(), &["@alice:server.org", "alice"]);
+        let _ = sub.try_recv(); // DmAdded
+        let removed = b.remove_dm(&r).unwrap();
+        assert_eq!(removed, "Alice");
+        match sub.try_recv().unwrap() {
+            FromMatrix::DmRemoved { nick } => assert_eq!(nick, "Alice"),
+            _ => panic!("expected DmRemoved"),
+        }
+        assert_eq!(b.dm_room_for("alice"), None);
+        assert_eq!(b.dm_room_for("@alice:server.org"), None);
+        assert_eq!(b.dm_nick_for(&r), None);
+        assert!(b.remove_dm(&r).is_none());
     }
 
     #[test]

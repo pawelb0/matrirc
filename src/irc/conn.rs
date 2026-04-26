@@ -180,6 +180,17 @@ async fn handle_matrix_event(
             }
             send(write, Message::with_prefix(prefix, "PART", params)).await?;
         }
+        FromMatrix::RoomRemoved { chan } => {
+            if !s.joined.remove(&chan) { return Ok(()); }
+            let Some(n) = s.nick.as_deref() else { return Ok(()); };
+            send(write, Message::with_prefix(user_prefix(n), "PART", vec![chan])).await?;
+        }
+        FromMatrix::DmRemoved { nick: peer } => {
+            if !s.registered { return Ok(()); }
+            if let Some(n) = s.nick.as_deref() {
+                matrirc_notice(write, n, &format!("DM with {peer} ended (left on Matrix)")).await?;
+            }
+        }
     }
     Ok(())
 }
@@ -211,7 +222,7 @@ async fn handle_command(
             handle_join(write, &n, msg, &mut s.joined, bridge, &s.caps).await?;
         },
         "PART" => if let Some(n) = s.nick.clone() {
-            handle_part(write, &n, msg, &mut s.joined).await?;
+            handle_part(write, &n, msg, &mut s.joined, bridge).await?;
         },
         "PRIVMSG" => if let Some(n) = s.nick.clone() {
             handle_privmsg(write, &n, msg, bridge, s).await?;
@@ -329,9 +340,16 @@ async fn handle_join(
             continue;
         }
         if let Some(room) = bridge.room_for(chan) {
-            let topic = bridge.topic_for(chan).unwrap_or_default();
-            join_bridged(write, nick, chan, &room, &topic, bridge, caps).await?;
-            joined.insert(chan.to_string());
+            // User may have typed an alias; the bridge stores by slug. Redirect.
+            let canonical = bridge.chan_for(&room).unwrap_or_else(|| chan.to_string());
+            if canonical != chan {
+                matrirc_notice(write, nick,
+                    &format!("'{chan}' is bridged as '{canonical}'")).await?;
+            }
+            if joined.insert(canonical.clone()) {
+                let topic = bridge.topic_for(&canonical).unwrap_or_default();
+                join_bridged(write, nick, &canonical, &room, &topic, bridge, caps).await?;
+            }
             continue;
         }
         if is_matrix_alias(chan) {
@@ -883,6 +901,7 @@ async fn handle_part(
     nick: &str,
     msg: &Message,
     joined: &mut HashSet<String>,
+    bridge: &Bridge,
 ) -> Result<()> {
     let Some(target) = msg.params.first() else { return Ok(()); };
     let reason = msg.params.get(1).cloned().unwrap_or_default();
@@ -896,6 +915,22 @@ async fn handle_part(
             params.push(reason.clone());
         }
         send(write, Message::with_prefix(user_prefix(nick), "PART", params)).await?;
+
+        // Skip the bot/echo channels — they have no Matrix room.
+        let Some(room) = bridge.room_for(chan) else { continue; };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if bridge.to_matrix.try_send(ToMatrix::LeaveRoom { room, reply: tx }).is_err() {
+            warn!(%chan, "leave dispatch failed (channel full or matrix sync down)");
+            continue;
+        }
+        let chan_log = chan.to_string();
+        tokio::spawn(async move {
+            match rx.await {
+                Ok(Ok(())) => info!(chan = %chan_log, "left matrix room"),
+                Ok(Err(e)) => warn!(chan = %chan_log, "leave failed: {e}"),
+                Err(_) => warn!(chan = %chan_log, "leave reply dropped"),
+            }
+        });
     }
     Ok(())
 }
@@ -1092,7 +1127,7 @@ mod tests {
     async fn channel_peer_message() {
         let (b, _rx) = Bridge::new(Mapping::default());
         let r = room("!a:server");
-        b.add_mapping(r.clone(), "#room-a".into(), "topic".into());
+        b.add_mapping(r.clone(), "#room-a".into(), "topic".into(), &[]);
         let mut s = registered_state("alice");
         s.joined.insert("#room-a".into());
         let out = route(
@@ -1149,7 +1184,7 @@ mod tests {
     async fn channel_not_joined_is_dropped() {
         let (b, _rx) = Bridge::new(Mapping::default());
         let r = room("!a:server");
-        b.add_mapping(r.clone(), "#room-a".into(), "".into());
+        b.add_mapping(r.clone(), "#room-a".into(), "".into(), &[]);
         let mut s = registered_state("alice"); // no joined insert
         let out = route(
             FromMatrix::Message { room: r, sender_nick: "alice".into(), body: "hi".into(), is_own: false },
@@ -1291,7 +1326,7 @@ mod tests {
     async fn multi_line_body_produces_multiple_privmsg() {
         let (b, _rx) = Bridge::new(Mapping::default());
         let r = room("!a:server");
-        b.add_mapping(r.clone(), "#room-a".into(), "".into());
+        b.add_mapping(r.clone(), "#room-a".into(), "".into(), &[]);
         let mut s = registered_state("alice");
         s.joined.insert("#room-a".into());
         let out = route(
@@ -1354,7 +1389,7 @@ mod tests {
         use crate::bridge::ToMatrix;
         let (b, mut rx) = Bridge::new(Mapping::default());
         let r = room("!a:server");
-        b.add_mapping(r.clone(), "#room-a".into(), "topic".into());
+        b.add_mapping(r.clone(), "#room-a".into(), "topic".into(), &[]);
 
         tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {

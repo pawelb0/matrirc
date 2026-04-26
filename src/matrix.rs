@@ -345,18 +345,53 @@ async fn join_by_alias(
         .await
         .map_err(|e| format!("{e:#}"))?;
 
+    register_joined_room(client, bridge, name_store, &room).await;
+    bridge
+        .chan_for(room.room_id())
+        .or_else(|| bridge.dm_nick_for(room.room_id()))
+        .ok_or_else(|| "joined but no chan registered (DM detection?)".into())
+}
+
+/// Adds a freshly-joined Matrix room to the bridge mapping. Detects DMs and
+/// uses `add_dm`; otherwise assigns a slug, registers canonical + alt aliases
+/// as extra `chan_to_room` keys, and broadcasts `RoomAdded`. Idempotent for
+/// channels (re-runs return the existing slug from `NameStore`); for DMs,
+/// `add_dm` overwrites with the same canonical nick.
+async fn register_joined_room(
+    client: &Client,
+    bridge: &Bridge,
+    name_store: &Arc<NameStore>,
+    room: &Room,
+) {
+    let rid = room.room_id();
+    if room.is_direct().await.unwrap_or(false) {
+        register_dm(client, bridge, room).await;
+        return;
+    }
     let name = room
         .display_name()
         .await
         .map(|n| n.to_string())
-        .unwrap_or_else(|_| alias.to_string());
-    let preferred = preferred_channel_name(room.room_id(), Some(&name));
-    let chan = name_store
-        .assign_or_get(room.room_id(), &preferred)
-        .map_err(|e| format!("assign chan: {e}"))?;
+        .unwrap_or_else(|_| "<no name>".into());
+    let preferred = preferred_channel_name(rid, Some(&name));
+    let chan = match name_store.assign_or_get(rid, &preferred) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(%rid, "name assign: {e}");
+            return;
+        }
+    };
     let topic = room.topic().unwrap_or_else(|| name.clone());
-    bridge.add_mapping(room.room_id().to_owned(), chan.clone(), topic);
-    Ok(chan)
+    let mut alias_strings: Vec<String> = room
+        .canonical_alias()
+        .into_iter()
+        .map(|a| a.to_string())
+        .chain(room.alt_aliases().into_iter().map(|a| a.to_string()))
+        .collect();
+    alias_strings.sort();
+    alias_strings.dedup();
+    let alias_refs: Vec<&str> = alias_strings.iter().map(String::as_str).collect();
+    bridge.add_mapping(rid.to_owned(), chan, topic, &alias_refs);
 }
 
 async fn whois_lookup(client: &Client, nick: &str) -> Option<WhoisInfo> {
@@ -634,21 +669,12 @@ pub async fn run_sync(
     };
 
     for room in client.rooms() {
-        let name = room.display_name().await.map(|n| n.to_string()).unwrap_or_else(|_| "<no name>".into());
         let rid = room.room_id();
+        let name = room.display_name().await.map(|n| n.to_string()).unwrap_or_else(|_| "<no name>".into());
         info!(target: "matrirc::rooms", room = %rid, "{name} [{:?}]", room.state());
         if !matches!(room.state(), RoomState::Joined) { continue; }
         if env_override_room.as_deref().map(|o| o != rid).unwrap_or(false) { continue; }
-
-        if room.is_direct().await.unwrap_or(false) {
-            register_dm(&client, &bridge, &room).await;
-            continue;
-        }
-        let preferred = preferred_channel_name(rid, Some(&name));
-        match name_store.assign_or_get(rid, &preferred) {
-            Ok(chan) => bridge.add_mapping(rid.to_owned(), chan, room.topic().unwrap_or_else(|| name.clone())),
-            Err(e) => warn!(%rid, "name assign: {e}"),
-        }
+        register_joined_room(&client, &bridge, &name_store, &room).await;
     }
 
     info!(
@@ -727,12 +753,31 @@ pub async fn run_sync(
     {
         let bridge = bridge.clone();
         let own = own_id.clone();
+        let name_store_for_member = name_store.clone();
+        let client_for_member = client.clone();
         client.add_event_handler(move |ev: SyncRoomMemberEvent, room: Room| {
             let bridge = bridge.clone();
             let own = own.clone();
+            let name_store = name_store_for_member.clone();
+            let client = client_for_member.clone();
             async move {
                 let Some(orig) = ev.as_original() else { return; };
-                if orig.state_key == own { return; }
+                if orig.state_key == own {
+                    match orig.membership_change() {
+                        MembershipChange::Joined | MembershipChange::InvitationAccepted => {
+                            register_joined_room(&client, &bridge, &name_store, &room).await;
+                        }
+                        MembershipChange::Left
+                        | MembershipChange::Kicked
+                        | MembershipChange::Banned
+                        | MembershipChange::KickedAndBanned => {
+                            bridge.remove_mapping(room.room_id());
+                            bridge.remove_dm(room.room_id());
+                        }
+                        _ => {}
+                    }
+                    return;
+                }
                 let Some(chan) = bridge.chan_for(room.room_id()) else { return; };
                 let nick = match orig.content.displayname.as_deref() {
                     Some(d) => sanitize_nick(d),
@@ -812,6 +857,15 @@ pub async fn run_sync(
                     if let Err(e) = send_client.account().set_display_name(Some(&name)).await {
                         warn!("set display name: {e:#}");
                     }
+                }
+                ToMatrix::LeaveRoom { room, reply } => {
+                    let result = match send_client.get_room(&room) {
+                        Some(r) => r.leave().await
+                            .map(|_| ())
+                            .map_err(|e| format!("{e:#}")),
+                        None => Err("unknown room".into()),
+                    };
+                    let _ = reply.send(result);
                 }
                 ToMatrix::SetTopic { room, topic } => {
                     if let Some(r) = send_client.get_room(&room) {
