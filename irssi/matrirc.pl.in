@@ -12,8 +12,12 @@ our %IRSSI = (
 );
 
 my $BIN       = '__MATRIRC_BIN__';
-my $HOST      = '127.0.0.1';
-my $PORT      = 6667;
+my ($HOST, $PORT) = ('127.0.0.1', 6667);
+if (my $bind = $ENV{MATRIRC_BIND}) {
+    if ($bind =~ /^(.+):(\d+)$/) {
+        ($HOST, $PORT) = ($1, $2 + 0);
+    }
+}
 my $STATE_DIR = "$ENV{HOME}/.local/state/matrirc";
 my $LOG       = "$STATE_DIR/log";
 my $PID_FILE  = "$STATE_DIR/daemon.pid";
