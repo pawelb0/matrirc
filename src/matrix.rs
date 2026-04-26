@@ -332,14 +332,28 @@ async fn join_by_alias(
     name_store: &Arc<NameStore>,
     alias: &str,
 ) -> Result<String, String> {
-    use matrix_sdk::ruma::{OwnedServerName, RoomOrAliasId};
+    use matrix_sdk::ruma::{OwnedServerName, RoomAliasId, RoomOrAliasId};
 
     let parsed = <&RoomOrAliasId>::try_from(alias).map_err(|e| format!("bad alias: {e}"))?;
-    let via: Vec<OwnedServerName> = alias
-        .rsplit_once(':')
-        .and_then(|(_, server)| OwnedServerName::try_from(server).ok())
-        .into_iter()
-        .collect();
+    // For aliases, resolve first so we can pass the directory's `servers` as
+    // `via` hints. Without those, the homeserver answers
+    // `M_UNKNOWN: no servers that are in the room have been provided` whenever
+    // the alias's host isn't itself a resident of the room.
+    let via: Vec<OwnedServerName> = if let Ok(alias_id) = <&RoomAliasId>::try_from(alias) {
+        match client.resolve_room_alias(alias_id).await {
+            Ok(r) => r.servers,
+            Err(e) => {
+                warn!(%alias, "resolve_room_alias failed, joining without via: {e:#}");
+                Vec::new()
+            }
+        }
+    } else {
+        alias
+            .rsplit_once(':')
+            .and_then(|(_, server)| OwnedServerName::try_from(server).ok())
+            .into_iter()
+            .collect()
+    };
     let room = client
         .join_room_by_id_or_alias(parsed, &via)
         .await
