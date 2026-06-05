@@ -1113,6 +1113,7 @@ pub async fn run_sync(
                 proxy_client,
                 proxy_index,
                 proxy_bridge,
+                cfg.get_local_password(),
             ).await {
                 warn!("attach proxy stopped: {e:#}");
             }

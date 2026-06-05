@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 
-use crate::config::config_path;
+use crate::config::{ config_path, hash_password };
 use crate::matrix;
 
 const PERL_TEMPLATE: &str = include_str!("../irssi/matrirc.pl.in");
@@ -79,11 +79,12 @@ pub fn set_local_password(
     let cfg_path = config_path()?;
     let mut cfg = crate::config::Config::load(&cfg_path)
         .with_context(|| format!("load config {}", cfg_path.display()))?;
-    if clear {
-        cfg.local_password = "".into();
+    cfg.local_password = if clear {
+        "".into()
     } else {
-        cfg.local_password = read_secret("MATRIRC_LOCAL_PASSWORD", "local_password", Some("Local connection password: "))?;
-    }
+        let password = read_secret("MATRIRC_LOCAL_PASSWORD", "local_password", Some("Local connection password: "))?;
+        hash_password(&password)?
+    };
     cfg.save(&cfg_path)?;
     return Ok(());
 }
