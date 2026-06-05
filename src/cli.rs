@@ -66,6 +66,26 @@ pub enum Command {
     Status,
     /// SIGTERM the running daemon.
     Stop,
+    /// Set access password.
+    LocalPassword {
+        #[arg(long)]
+        clear: bool,
+    },
+}
+
+pub fn set_local_password(
+    clear: bool,
+) -> Result<()> {
+    let cfg_path = config_path()?;
+    let mut cfg = crate::config::Config::load(&cfg_path)
+        .with_context(|| format!("load config {}", cfg_path.display()))?;
+    if clear {
+        cfg.local_password = "".into();
+    } else {
+        cfg.local_password = read_secret("MATRIRC_LOCAL_PASSWORD", "local_password", Some("Local connection password: "))?;
+    }
+    cfg.save(&cfg_path)?;
+    return Ok(());
 }
 
 pub async fn login(

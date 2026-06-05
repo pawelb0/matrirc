@@ -29,6 +29,7 @@ async fn main() -> Result<()> {
         Command::Verify => cli::verify().await,
         Command::Status => cli::status(),
         Command::Stop => cli::stop(),
+        Command::LocalPassword { clear } => cli::set_local_password(clear),
     }
 }
 
