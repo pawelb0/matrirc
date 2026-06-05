@@ -82,6 +82,22 @@ pub(crate) struct UploadRequest {
     pub content_length: usize,
 }
 
+
+fn get_header_value<T: std::str::FromStr>(
+    head: &str,
+    header_name: &str,
+) -> Option<T> {
+    let mut header_value: Option<T> = None;
+    for line in head.lines() {
+        let line = line.trim_end_matches('\r');
+        let Some((k, v)) = line.split_once(':') else { continue };
+        if k.eq_ignore_ascii_case(header_name) {
+            header_value = v.trim().parse().ok();
+        }
+    }
+    return header_value;
+}
+
 pub(crate) fn parse_upload_request(head: &str) -> Result<UploadRequest, &'static str> {
     let mut lines = head.lines();
     let request_line = lines.next().ok_or("empty request")?;
@@ -113,18 +129,11 @@ pub(crate) fn parse_upload_request(head: &str) -> Result<UploadRequest, &'static
     }
     let filename = filename.filter(|s| !s.is_empty()).ok_or("missing filename")?;
 
-    let mut content_length: Option<usize> = None;
-    for line in lines {
-        let line = line.trim_end_matches('\r');
-        let Some((k, v)) = line.split_once(':') else { continue };
-        if k.eq_ignore_ascii_case("content-length") {
-            content_length = v.trim().parse().ok();
-        }
-    }
-    let content_length = content_length.ok_or("missing content-length")?;
+    let content_length : usize = get_header_value(head, "content-length").ok_or("missing content-length")?;
 
     Ok(UploadRequest { scope, filename, caption, content_length })
 }
+
 
 async fn handle(
     mut sock: TcpStream,
