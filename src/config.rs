@@ -14,6 +14,10 @@ pub struct Config {
     /// command (`/msg matrirc ids on|off`) overrides at runtime.
     #[serde(default = "default_true")]
     pub show_reply_ids: bool,
+    #[serde(default)]
+    /// Connection password for the IRC connection and HTTP::BasicAuth password
+    /// for the media proxy; empty string equals no auth
+    pub local_password: String,
 }
 
 fn default_true() -> bool { true }
