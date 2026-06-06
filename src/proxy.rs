@@ -100,7 +100,7 @@ fn get_header_value<T: std::str::FromStr>(
             header_value = v.trim().parse().ok();
         }
     }
-    return header_value;
+    header_value
 }
 
 pub(crate) fn parse_upload_request(head: &str) -> Result<UploadRequest, &'static str> {
@@ -153,7 +153,7 @@ fn check_auth(
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .and_then(|user_and_pw| {
             let (_, password) = user_and_pw.split_once(':')?;
-            config::verify_password(&pw_hash, password).ok()
+            config::verify_password(pw_hash, password).ok()
         }).is_some()
 }
 

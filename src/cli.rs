@@ -86,7 +86,7 @@ pub fn set_local_password(
         hash_password(&password)?
     };
     cfg.save(&cfg_path)?;
-    return Ok(());
+    Ok(())
 }
 
 pub async fn login(

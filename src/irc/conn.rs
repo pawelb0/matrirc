@@ -253,7 +253,7 @@ fn check_auth(
         return false;
     };
 
-    config::verify_password(&pw_hash, connection_password).is_ok()
+    config::verify_password(pw_hash, connection_password).is_ok()
 }
 
 
@@ -281,7 +281,7 @@ pub async fn handle(sock: TcpStream, peer: SocketAddr, bridge: Bridge, connectio
                 if !s.registered {
                     if let (Some(n), Some(_)) = (s.nick.clone(), s.user.clone()) {
                         if !check_auth(&s.received_password, &s.password_hash) {
-                            send(&mut write, srv(rpl::ERR_PASSWDMISMATCH, vec![n.into(), "Password Incorrect".into()])).await?;
+                            send(&mut write, srv(rpl::ERR_PASSWDMISMATCH, vec![n, "Password Incorrect".into()])).await?;
                             send(&mut write, srv("ERROR", vec!["Closing Link".into(), "(Bad Password)".into()])).await?;
                             info!(%peer, "client dropped (bad password)");
                             return Ok(());
