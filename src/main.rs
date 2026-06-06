@@ -50,7 +50,7 @@ async fn run() -> Result<()> {
     let name_store = Arc::new(names::NameStore::load(store_path)?);
 
     let cfg_path = config::config_path()?;
-    let matrix_handle = match config::Config::load(&cfg_path) {
+    let (matrix_handle, local_password) = match config::Config::load(&cfg_path) {
         Ok(cfg) => {
             tracing::info!("matrix: config loaded from {}", cfg_path.display());
             bridge_state
@@ -59,23 +59,24 @@ async fn run() -> Result<()> {
             let b = bridge_state.clone();
             let ns = name_store.clone();
             let only = env_override_room.clone();
-            Some(tokio::spawn(async move {
+            let local_password = cfg.get_local_password();
+            (Some(tokio::spawn(async move {
                 if let Err(e) = matrix::run_sync(cfg, b, to_matrix_rx, ns, only).await {
                     warn!("matrix sync error: {e:#}");
                 }
-            }))
+            })), local_password)
         }
         Err(e) => {
             warn!(
                 "no matrix config at {} ({e}); run `matrirc login` to enable sync",
                 cfg_path.display()
             );
-            None
+            (None, None)
         }
     };
 
     let bind = std::env::var("MATRIRC_BIND").unwrap_or_else(|_| "127.0.0.1:6667".into());
-    let serve = irc::serve(&bind, bridge_state);
+    let serve = irc::serve(&bind, bridge_state, &local_password);
     tokio::pin!(serve);
     let result = tokio::select! {
         r = &mut serve => r,

@@ -12,6 +12,7 @@ use tracing::{debug, info, warn};
 
 use super::proto::Message;
 use crate::bridge::{Bridge, FromMatrix, ToMatrix};
+use crate::config;
 
 const ISO_FMT: &[FormatItem<'static>] = format_description!(
     "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
@@ -58,6 +59,7 @@ mod rpl {
     pub const ENDOFMOTD: &str = "376";
     pub const ERR_NOSUCHNICK: &str = "401";
     pub const ERR_NOSUCHCHANNEL: &str = "403";
+    pub const ERR_PASSWDMISMATCH: &str = "464";
 }
 
 const ECHO_NICK: &str = "echo";
@@ -110,6 +112,9 @@ struct State {
     /// Monotonic counter feeding synthesised event ids for `#echo` replies,
     /// so the test bot exercises the same msgid/!r flow as Matrix.
     echo_counter: u64,
+    /// If password_hash is set, verify the password sent via PASS against the hash
+    password_hash: Option<String>,
+    received_password: Option<String>,
 }
 
 fn synth_echo_event_id(counter: &mut u64) -> matrix_sdk::ruma::OwnedEventId {
@@ -235,7 +240,24 @@ fn make_payloads(
     (short, chunk_for_irc(&flattened))
 }
 
-pub async fn handle(sock: TcpStream, peer: SocketAddr, bridge: Bridge) -> Result<()> {
+
+fn check_auth(
+    pw: &Option<String>,
+    local_password : &Option<String>,
+) -> bool {
+    let Some(pw_hash) = local_password else {
+        return true;
+    };
+
+    let Some(connection_password) = pw else {
+        return false;
+    };
+
+    config::verify_password(&pw_hash, connection_password).is_ok()
+}
+
+
+pub async fn handle(sock: TcpStream, peer: SocketAddr, bridge: Bridge, connection_password: &Option<String>) -> Result<()> {
     let (read, mut write) = sock.into_split();
     let mut lines = BufReader::new(read).lines();
     let mut from_matrix = bridge.from_matrix.subscribe();
@@ -243,6 +265,7 @@ pub async fn handle(sock: TcpStream, peer: SocketAddr, bridge: Bridge) -> Result
         show_reply_ids: bridge
             .default_show_reply_ids
             .load(std::sync::atomic::Ordering::Relaxed),
+        password_hash: connection_password.clone(),
         ..State::default()
     };
 
@@ -257,6 +280,14 @@ pub async fn handle(sock: TcpStream, peer: SocketAddr, bridge: Bridge) -> Result
                 if handle_command(&mut write, &peer, &bridge, &msg, &mut s).await? { return Ok(()); }
                 if !s.registered {
                     if let (Some(n), Some(_)) = (s.nick.clone(), s.user.clone()) {
+                        if !check_auth(&s.received_password, &s.password_hash) {
+                            send(&mut write, srv(rpl::ERR_PASSWDMISMATCH, vec![n.into(), "Password Incorrect".into()])).await?;
+                            send(&mut write, srv("ERROR", vec!["Closing Link".into(), "(Bad Password)".into()])).await?;
+                            info!(%peer, "client dropped (bad password)");
+                            return Ok(());
+                        }
+
+
                         send_welcome(&mut write, &n).await?;
                         s.registered = true;
                         info!(%peer, nick = %n, "client registered");
@@ -414,6 +445,7 @@ async fn handle_command(
     let p0 = msg.params.first().map(String::as_str);
     match msg.command.as_str() {
         "CAP" => handle_cap(write, msg, &mut s.caps).await?,
+        "PASS" => if let Some(p) = p0 { s.received_password = Some(p.into()); },
         "NICK" => if let Some(n) = p0 {
             let new = n.to_string();
             let old = s.nick.replace(new.clone());
