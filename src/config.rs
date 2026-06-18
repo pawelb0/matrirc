@@ -3,6 +3,12 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use pbkdf2::{
+    password_hash::{PasswordHasher, PasswordVerifier},
+    phc::PasswordHash,
+    Pbkdf2
+};
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Config {
     pub mxid: String,
@@ -14,6 +20,10 @@ pub struct Config {
     /// command (`/msg matrirc ids on|off`) overrides at runtime.
     #[serde(default = "default_true")]
     pub show_reply_ids: bool,
+    #[serde(default)]
+    /// Connection password for the IRC connection and HTTP::BasicAuth password
+    /// for the media proxy; empty string equals no auth
+    pub local_password: String,
 }
 
 fn default_true() -> bool { true }
@@ -36,6 +46,27 @@ impl Config {
             .with_context(|| format!("write {}", path.display()))?;
         Ok(())
     }
+
+    pub fn get_local_password(&self) -> Option<String> {
+        if self.local_password.is_empty() {
+            None
+        } else {
+            Some(self.local_password.clone())
+        }
+    }
+
+}
+
+pub(crate) fn hash_password(pw : &str) -> Result<String> {
+    let pbkdf2 = Pbkdf2::default();
+    Ok(pbkdf2.hash_password(pw.as_bytes())?
+        .to_string())
+}
+
+pub(crate) fn verify_password(hash : &str, pw : &str) -> Result<()>  {
+    let pbkdf2 = Pbkdf2::default();
+    let parsed_hash = PasswordHash::new(hash)?;
+    Ok(pbkdf2.verify_password(pw.as_bytes(), &parsed_hash)?)
 }
 
 pub fn config_path() -> Result<PathBuf> {
@@ -83,6 +114,7 @@ mod tests {
             access_token: "secret123".into(),
             device_id: "DEVABC".into(),
             show_reply_ids: true,
+            local_password: "".into(),
         };
         cfg.save(&path).unwrap();
         let loaded = Config::load(&path).unwrap();
@@ -101,6 +133,7 @@ mod tests {
             access_token: "t".into(),
             device_id: "D".into(),
             show_reply_ids: true,
+            local_password: "".into(),
         };
         cfg.save(&path).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;

@@ -15,6 +15,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, warn};
 
+use crate::config;
+use base64::Engine;
+
 const MAX_INDEX: usize = 1024;
 const MAX_REQ_BYTES: usize = 8192;
 
@@ -58,6 +61,7 @@ pub async fn run_proxy(
     client: Client,
     index: Arc<AttachIndex>,
     bridge: crate::bridge::Bridge,
+    local_password: Option<String>,
 ) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
     info!("attach proxy listening on http://{addr}");
@@ -66,8 +70,9 @@ pub async fn run_proxy(
         let client = client.clone();
         let index = index.clone();
         let bridge = bridge.clone();
+        let local_password = local_password.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle(sock, client, index, bridge).await {
+            if let Err(e) = handle(sock, client, index, bridge, &local_password).await {
                 debug!("proxy: {e:#}");
             }
         });
@@ -80,6 +85,22 @@ pub(crate) struct UploadRequest {
     pub filename: String,
     pub caption: Option<String>,
     pub content_length: usize,
+}
+
+
+fn get_header_value<T: std::str::FromStr>(
+    head: &str,
+    header_name: &str,
+) -> Option<T> {
+    let mut header_value: Option<T> = None;
+    for line in head.lines() {
+        let line = line.trim_end_matches('\r');
+        let Some((k, v)) = line.split_once(':') else { continue };
+        if k.eq_ignore_ascii_case(header_name) {
+            header_value = v.trim().parse().ok();
+        }
+    }
+    header_value
 }
 
 pub(crate) fn parse_upload_request(head: &str) -> Result<UploadRequest, &'static str> {
@@ -113,24 +134,36 @@ pub(crate) fn parse_upload_request(head: &str) -> Result<UploadRequest, &'static
     }
     let filename = filename.filter(|s| !s.is_empty()).ok_or("missing filename")?;
 
-    let mut content_length: Option<usize> = None;
-    for line in lines {
-        let line = line.trim_end_matches('\r');
-        let Some((k, v)) = line.split_once(':') else { continue };
-        if k.eq_ignore_ascii_case("content-length") {
-            content_length = v.trim().parse().ok();
-        }
-    }
-    let content_length = content_length.ok_or("missing content-length")?;
+    let content_length : usize = get_header_value(head, "content-length").ok_or("missing content-length")?;
 
     Ok(UploadRequest { scope, filename, caption, content_length })
 }
+
+fn check_auth(
+    head: &str,
+    local_password : &Option<String>,
+) -> bool {
+    let Some(pw_hash) = local_password else {
+        return true;
+    };
+
+    get_header_value(head, "Authorization")
+        .and_then(|header_value : String| header_value.strip_prefix("Basic ").map(str::to_owned))
+        .and_then(|b64| base64::prelude::BASE64_STANDARD.decode(b64).ok())
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|user_and_pw| {
+            let (_, password) = user_and_pw.split_once(':')?;
+            config::verify_password(pw_hash, password).ok()
+        }).is_some()
+}
+
 
 async fn handle(
     mut sock: TcpStream,
     client: Client,
     index: Arc<AttachIndex>,
     bridge: crate::bridge::Bridge,
+    local_password: &Option<String>,
 ) -> Result<()> {
     let mut buf = vec![0u8; MAX_REQ_BYTES];
     let mut total = 0;
@@ -148,6 +181,18 @@ async fn handle(
         }
     };
     let head_str = std::str::from_utf8(&buf[..header_end]).unwrap_or("");
+
+    if !check_auth(head_str, local_password) {
+        return write_status_with_header_and_body(
+                &mut sock,
+                401,
+                "Unauthorized",
+                vec!["WWW-Authenticate: Basic realm=matrirc"],
+                "Please authenticate",
+            )
+            .await
+    }
+
     let method = head_str
         .split_whitespace()
         .next()
@@ -310,11 +355,26 @@ async fn write_status_with_body(
     reason: &str,
     body: &str,
 ) -> Result<()> {
+    write_status_with_header_and_body(sock, code, reason, vec![], body).await
+}
+
+async fn write_status_with_header_and_body(
+    sock: &mut TcpStream,
+    code: u16,
+    reason: &str,
+    headers: Vec<&str>,
+    body: &str,
+) -> Result<()> {
+    let extra_header = if headers.is_empty() {
+        "".to_owned()
+    } else {
+        format!("\r\n{}", headers.join("\r\n"))
+    };
     let resp = format!(
         "HTTP/1.1 {code} {reason}\r\n\
          Content-Type: text/plain; charset=utf-8\r\n\
          Content-Length: {}\r\n\
-         Connection: close\r\n\r\n{body}",
+         Connection: close{extra_header}\r\n\r\n{body}",
         body.len()
     );
     sock.write_all(resp.as_bytes()).await?;
@@ -410,5 +470,35 @@ mod tests {
             EventId::parse(format!("$evt{}:server.tld", MAX_INDEX + 4)).unwrap();
         assert!(idx.get(&oldest).is_none());
         assert!(idx.get(&newest).is_some());
+    }
+
+    #[test]
+    fn check_pw() {
+
+        let pw           = "password123";
+        let pw_invalid   = "password567";
+        let pw_hash      = config::hash_password(pw).ok();
+        let b64_no_user  = base64::prelude::BASE64_STANDARD.encode(pw.as_bytes());
+        let b64_correct  = base64::prelude::BASE64_STANDARD.encode(("dummy:".to_owned() + pw).as_bytes());
+        let b64_wrong_pw = base64::prelude::BASE64_STANDARD.encode(("dummy:".to_owned() + pw_invalid).as_bytes());
+
+        let head_no_auth      = "POST /upload/peer?filename=x HTTP/1.1\r\n\r\n";
+        let head_wrong_method = "Authorization: Digest aasdfasdfa\r\n\r\n";
+        let head_non_b64      = "Authorization: Basic aasdfasdfa\r\n\r\n";
+        let head_correct      = format!("Authorization: Basic {b64_correct}\r\n\r\n");
+        let head_no_user      = format!("Authorization: Basic {b64_no_user}\r\n\r\n");
+        let head_wrong_pw     = format!("Authorization: Basic {b64_wrong_pw}\r\n\r\n");
+
+        // Allow no local password set
+        assert_eq!(check_auth(&head_no_auth,      &None),    true);
+        // Allow correct password with any user
+        assert_eq!(check_auth(&head_correct,      &pw_hash), true);
+
+        // Reject invalid configurations
+        assert_eq!(check_auth(&head_no_auth,      &pw_hash), false);
+        assert_eq!(check_auth(&head_wrong_method, &pw_hash), false);
+        assert_eq!(check_auth(&head_non_b64,      &pw_hash), false);
+        assert_eq!(check_auth(&head_no_user,      &pw_hash), false);
+        assert_eq!(check_auth(&head_wrong_pw,     &pw_hash), false);
     }
 }

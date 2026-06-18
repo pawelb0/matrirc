@@ -1113,6 +1113,7 @@ pub async fn run_sync(
                 proxy_client,
                 proxy_index,
                 proxy_bridge,
+                cfg.get_local_password(),
             ).await {
                 warn!("attach proxy stopped: {e:#}");
             }
@@ -1358,6 +1359,7 @@ pub async fn login_with_password(
             access_token: resp.access_token,
             device_id: resp.device_id.to_string(),
             show_reply_ids: true,
+            local_password: "".to_string(),
         },
         client,
     ))
@@ -1378,6 +1380,7 @@ pub async fn login_with_token(homeserver: &str, mxid: &str, token: &str) -> Resu
         access_token: token.to_string(),
         device_id,
         show_reply_ids: true,
+        local_password: "".to_string(),
     };
     let client = build_client_restored(&cfg).await?;
     Ok((cfg, client))

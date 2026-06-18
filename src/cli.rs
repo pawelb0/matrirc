@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 
-use crate::config::config_path;
+use crate::config::{ config_path, hash_password };
 use crate::matrix;
 
 const PERL_TEMPLATE: &str = include_str!("../irssi/matrirc.pl.in");
@@ -66,6 +66,27 @@ pub enum Command {
     Status,
     /// SIGTERM the running daemon.
     Stop,
+    /// Set access password.
+    LocalPassword {
+        #[arg(long)]
+        clear: bool,
+    },
+}
+
+pub fn set_local_password(
+    clear: bool,
+) -> Result<()> {
+    let cfg_path = config_path()?;
+    let mut cfg = crate::config::Config::load(&cfg_path)
+        .with_context(|| format!("load config {}", cfg_path.display()))?;
+    cfg.local_password = if clear {
+        "".into()
+    } else {
+        let password = read_secret("MATRIRC_LOCAL_PASSWORD", "local_password", Some("Local connection password: "))?;
+        hash_password(&password)?
+    };
+    cfg.save(&cfg_path)?;
+    Ok(())
 }
 
 pub async fn login(
