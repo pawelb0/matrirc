@@ -226,6 +226,8 @@ pub struct Bridge {
     /// this at register time and can flip their per-connection copy via the
     /// `ids` bot command.
     pub default_show_reply_ids: Arc<AtomicBool>,
+    /// Backfill all messages or just unread ones?
+    pub default_backfill_read_messages: Arc<AtomicBool>,
 }
 
 impl Bridge {
@@ -239,6 +241,7 @@ impl Bridge {
                 to_matrix: to_tx,
                 recent_sent: Arc::new(Mutex::new(VecDeque::with_capacity(RECENT_SENT_CAP))),
                 default_show_reply_ids: Arc::new(AtomicBool::new(true)),
+                default_backfill_read_messages: Arc::new(AtomicBool::new(true)),
             },
             to_rx,
         )

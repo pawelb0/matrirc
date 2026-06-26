@@ -14,6 +14,9 @@ pub struct Config {
     /// command (`/msg matrirc ids on|off`) overrides at runtime.
     #[serde(default = "default_true")]
     pub show_reply_ids: bool,
+    /// Backfill all messages or just unread ones?
+    #[serde(default = "default_true")]
+    pub backfill_read_messages: bool,
 }
 
 fn default_true() -> bool { true }
@@ -83,6 +86,7 @@ mod tests {
             access_token: "secret123".into(),
             device_id: "DEVABC".into(),
             show_reply_ids: true,
+            backfill_read_messages: true,
         };
         cfg.save(&path).unwrap();
         let loaded = Config::load(&path).unwrap();
@@ -101,6 +105,7 @@ mod tests {
             access_token: "t".into(),
             device_id: "D".into(),
             show_reply_ids: true,
+            backfill_read_messages: true,
         };
         cfg.save(&path).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;

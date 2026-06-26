@@ -55,6 +55,9 @@ async fn run() -> Result<()> {
             bridge_state
                 .default_show_reply_ids
                 .store(cfg.show_reply_ids, std::sync::atomic::Ordering::Relaxed);
+            bridge_state
+                .default_backfill_read_messages
+                .store(cfg.backfill_read_messages, std::sync::atomic::Ordering::Relaxed);
             let b = bridge_state.clone();
             let ns = name_store.clone();
             let only = env_override_room.clone();

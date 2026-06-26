@@ -12,6 +12,7 @@ use matrix_sdk::ruma::events::room::member::{MembershipChange, SyncRoomMemberEve
 use matrix_sdk::ruma::events::room::message::{
     MessageType, Relation, RoomMessageEventContent, SyncRoomMessageEvent,
 };
+use matrix_sdk::ruma::events::receipt::{ReceiptThread, ReceiptType};
 use matrix_sdk::ruma::events::room::topic::SyncRoomTopicEvent;
 use matrix_sdk::ruma::events::room::MediaSource;
 use matrix_sdk::ruma::events::{
@@ -882,10 +883,34 @@ async fn dm_peer(client: &Client, room: &Room) -> Option<(String, matrix_sdk::ru
     })
 }
 
+/// Decides if `ev` is an own message or not.
+fn event_is_own(
+    ev: &matrix_sdk::deserialized_responses::TimelineEvent,
+    me: Option<&matrix_sdk::ruma::UserId>,
+) -> bool {
+    let Some(me) = me else { return false; };
+    matches!(
+        ev.raw().get_field::<matrix_sdk::ruma::OwnedUserId>("sender"),
+        Ok(Some(sender)) if sender.as_str() == me.as_str()
+    )
+}
+
+/// Index of the first already-seen event in `events`. None when all events are unread.
+fn unread_boundary(
+    events: &[matrix_sdk::deserialized_responses::TimelineEvent],
+    read_markers: &[matrix_sdk::ruma::OwnedEventId],
+    me: Option<&matrix_sdk::ruma::UserId>,
+) -> Option<usize> {
+    events.iter().position(|ev| {
+        ev.event_id().is_some_and(|id| read_markers.contains(&id)) || event_is_own(ev, me)
+    })
+}
+
 async fn backfill(
     client: &Client,
     room_id: &matrix_sdk::ruma::RoomId,
     limit: u32,
+    only_unread: bool,
     attach_base: &str,
     attach_index: &crate::proxy::AttachIndex,
 ) -> Vec<BackfillMessage> {
@@ -900,6 +925,21 @@ async fn backfill(
             .await
         {
             tracing::debug!(room = %room_id, "key backup download skipped: {e}");
+        }
+    }
+    let mut read_markers = Vec::<matrix_sdk::ruma::OwnedEventId>::new();
+    if only_unread {
+        // Backfill only unread messages: collect various read receipts.
+        if let Some(me) = client.user_id() {
+            for receipt_type in [ReceiptType::Read, ReceiptType::ReadPrivate] {
+                for thread in [ReceiptThread::Main, ReceiptThread::Unthreaded] {
+                    match room.load_user_receipt(receipt_type.clone(), thread.clone(), me).await {
+                        Ok(Some((event_id, _))) => read_markers.push(event_id),
+                        Ok(None) => {}
+                        Err(e) => warn!(room = %room_id, "read receipt load failed: {e}"),
+                    }
+                }
+            }
         }
     }
     let mut collected = Vec::<matrix_sdk::deserialized_responses::TimelineEvent>::new();
@@ -922,6 +962,12 @@ async fn backfill(
             break;
         }
         collected.extend(page.chunk);
+        if only_unread {
+            if let Some(pos) = unread_boundary(&collected, &read_markers, client.user_id()) {
+                collected.truncate(pos);
+                break;
+            }
+        }
         match page.end {
             Some(t) => next_token = Some(t),
             None => break,
@@ -1264,7 +1310,10 @@ pub async fn run_sync(
                     send_to_mxid(&send_client, &send_bridge, &mxid, &body, emote, notice, in_reply_to).await;
                 }
                 ToMatrix::Backfill { room, limit, reply } => {
-                    let result = backfill(&send_client, &room, limit, &attach_base_sender, &attach_index_sender).await;
+                    let only_unread = !send_bridge
+                        .default_backfill_read_messages
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let result = backfill(&send_client, &room, limit, only_unread, &attach_base_sender, &attach_index_sender).await;
                     let _ = reply.send(result);
                 }
                 ToMatrix::Members { room, reply } => {
@@ -1358,6 +1407,7 @@ pub async fn login_with_password(
             access_token: resp.access_token,
             device_id: resp.device_id.to_string(),
             show_reply_ids: true,
+            backfill_read_messages: true,
         },
         client,
     ))
@@ -1378,6 +1428,7 @@ pub async fn login_with_token(homeserver: &str, mxid: &str, token: &str) -> Resu
         access_token: token.to_string(),
         device_id,
         show_reply_ids: true,
+        backfill_read_messages: true,
     };
     let client = build_client_restored(&cfg).await?;
     Ok((cfg, client))
@@ -1716,5 +1767,67 @@ mod tests {
         assert_eq!(sanitize_nick("!!!"), "_");
         assert_eq!(sanitize_nick(""), "_");
         assert_eq!(sanitize_nick("a".repeat(40).as_str()).len(), 16);
+    }
+
+    fn uid(s: &str) -> matrix_sdk::ruma::OwnedUserId {
+        matrix_sdk::ruma::OwnedUserId::try_from(s).unwrap()
+    }
+
+    fn timeline_event(event_id: &str, sender: &str) -> matrix_sdk::deserialized_responses::TimelineEvent {
+        // Deserialize from a string: `Raw` wraps a serde_json RawValue, which
+        // cannot be built via `from_value`.
+        let json = format!(
+            r#"{{"type":"m.room.message","event_id":"{event_id}","sender":"{sender}","origin_server_ts":0,"content":{{"msgtype":"m.text","body":"hi"}}}}"#
+        );
+        let raw: matrix_sdk::ruma::serde::Raw<AnySyncTimelineEvent> =
+            serde_json::from_str(&json).unwrap();
+        matrix_sdk::deserialized_responses::TimelineEvent::from_plaintext(raw)
+    }
+
+    #[test]
+    fn event_is_own_matches_sender() {
+        let me = uid("@me:server.tld");
+        let mine = timeline_event("$1:server.tld", "@me:server.tld");
+        let theirs = timeline_event("$2:server.tld", "@peer:server.tld");
+        assert!(event_is_own(&mine, Some(&me)));
+        assert!(!event_is_own(&theirs, Some(&me)));
+        // No logged-in user: nothing is "own".
+        assert!(!event_is_own(&mine, None));
+    }
+
+    #[test]
+    fn unread_boundary_stops_at_read_receipt() {
+        // newest -> oldest; the read receipt points at the 3rd event.
+        let events = [
+            timeline_event("$new2:server.tld", "@peer:server.tld"),
+            timeline_event("$new1:server.tld", "@peer:server.tld"),
+            timeline_event("$read:server.tld", "@peer:server.tld"),
+            timeline_event("$old:server.tld", "@peer:server.tld"),
+        ];
+        let markers = vec![evt("$read:server.tld")];
+        assert_eq!(unread_boundary(&events, &markers, None), Some(2));
+    }
+
+    #[test]
+    fn unread_boundary_prefers_newer_own_message() {
+        let me = uid("@me:server.tld");
+        // Our own reply is newer than the read receipt, so it is the boundary.
+        let events = [
+            timeline_event("$incoming:server.tld", "@peer:server.tld"),
+            timeline_event("$myreply:server.tld", "@me:server.tld"),
+            timeline_event("$read:server.tld", "@peer:server.tld"),
+        ];
+        let markers = vec![evt("$read:server.tld")];
+        assert_eq!(unread_boundary(&events, &markers, Some(&me)), Some(1));
+    }
+
+    #[test]
+    fn unread_boundary_none_when_all_unread() {
+        let me = uid("@me:server.tld");
+        let events = [
+            timeline_event("$a:server.tld", "@peer:server.tld"),
+            timeline_event("$b:server.tld", "@peer:server.tld"),
+        ];
+        assert_eq!(unread_boundary(&events, &[], Some(&me)), None);
     }
 }

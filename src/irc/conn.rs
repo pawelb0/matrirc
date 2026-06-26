@@ -367,6 +367,12 @@ async fn handle_matrix_event(
             if s.registered {
                 if let Some(n) = s.nick.as_deref() {
                     matrirc_notice(write, n, &format!("DM available: /msg {dm} ...")).await?;
+                    // RoomAdded does backfill as part of join_bridged(), here do it directly.
+                    if let Some(room) = bridge.dm_room_for(&dm) {
+                        if s.dm_backfilled.insert(room.clone()) {
+                            backfill_channel(write, n, &room, bridge, &s.caps, &mut s.reply_ids, s.show_reply_ids).await?;
+                        }
+                    }
                 }
             }
         }
