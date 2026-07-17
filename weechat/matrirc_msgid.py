@@ -8,6 +8,13 @@ SCRIPT_LICENSE = "GPL3"
 SCRIPT_DESC = "Prefix incoming matrirc messages with [id] from msgid tag"
 
 def msgid_modifier_cb(data, modifier, modifier_data, string):
+    # weechat passes bytes (not str) when the message is not valid UTF-8.
+    if isinstance(string, bytes):
+        result = _add_msgid(string.decode('utf-8', 'surrogateescape'))
+        return result.encode('utf-8', 'surrogateescape')
+    return _add_msgid(string)
+
+def _add_msgid(string):
     # Match tags, prefix (optional), command, target, and body
     # Format: @tags rest
     if not string.startswith('@'):
