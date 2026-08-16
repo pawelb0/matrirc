@@ -30,6 +30,8 @@ use crate::bridge::{
 use crate::config::Config;
 use crate::names::{preferred_channel_name, NameStore};
 
+use urlencoding::encode;
+
 #[derive(Debug, Deserialize)]
 struct WellKnown {
     #[serde(rename = "m.homeserver")]
@@ -480,8 +482,10 @@ fn media_line(
     event_id: &matrix_sdk::ruma::EventId,
     attach_base: &str,
 ) -> String {
+    let cleaned_caption = caption.replace(['/', '\\', '"'], "_");
+    let suffix = encode(&cleaned_caption);
     format!(
-        "{C_SILVER}[{kind}]{C_RESET} {caption} <{attach_base}/attach/{event_id}>"
+        "{C_SILVER}[{kind}]{C_RESET} {caption} <{attach_base}/attach/{event_id}/{suffix}>"
     )
 }
 
