@@ -1,22 +1,18 @@
 # Changelog
 
-## 0.3.0 — 2026-05-22
+## 0.3.0 (2026-05-22)
 
-### Action required
-
-Re-run `matrirc install-irssi --force` after upgrading. The bundled
-`matrirc.pl` gained the IRCv3 `msgid` renderer; without the new script
-inbound messages won't carry a `[id]` and `!r` replies have nothing to
-target.
+After upgrading, run `matrirc install-irssi --force` to update the irssi
+script. The new script displays the message IDs used for replies.
 
 ### Added
 
-- `!r <id> text` replies. matrirc tags inbound matrix messages with a
-  3-letter `msgid`; `!r abc text` resolves the short, sets
-  `m.in_reply_to` + body fallback, sends.
-- `/msg matrirc join <#alias:server | !room:server>` — join by alias
-  or room id.
-- `/msg matrirc knock <target> [reason]` — knock on invite-only rooms.
-- `/msg matrirc ids on|off|toggle|status` — per-connection toggle for
-  reply ids. `show_reply_ids` in `config.toml` for the daemon default.
-- `/msg matrirc dump <window>` — inspect the reply-id ring.
+- Reply to a message with `!r <id> text`. Incoming messages have three-letter
+  IDs; replies reference the original Matrix event and include a text fallback.
+- Join rooms by alias or ID with
+  `/msg matrirc join <#alias:server or !room:server>`.
+- Request admission to a room with `/msg matrirc knock <target> [reason]`.
+- Control reply-ID display per connection with
+  `/msg matrirc ids on|off|toggle|status`. The `show_reply_ids` setting in
+  `config.toml` sets the default.
+- Inspect stored reply targets with `/msg matrirc dump <window>`.

@@ -1,262 +1,279 @@
 # matrirc
 
-Local IRC server backed by Matrix. Point irssi/weechat/hexchat at
-`127.0.0.1:6667` and talk to your Matrix rooms + DMs from there. E2EE
-included.
+matrirc runs a local IRC server for your Matrix account. Connect with irssi,
+WeeChat, or HexChat to read and send messages in rooms and DMs, including
+end-to-end encrypted rooms.
 
-![matrirc setup + irssi demo](demo/demo.gif)
+![matrirc setup and irssi demo](demo/demo.gif)
 
 ## Install
 
-Homebrew:
+With Homebrew:
 
-```
+```sh
 brew tap pawelb0/tap
 brew install matrirc
 ```
 
-Nightly, tracking `main` (keg-only, so link it onto `PATH`):
+For nightly builds from `main`:
 
-```
+```sh
 brew install matrirc-nightly
 brew link --overwrite matrirc-nightly
 ```
 
-From source:
+The nightly formula is keg-only; the second command puts it on `PATH`.
 
-```
+From a source checkout:
+
+```sh
 cargo install --path .
 ```
 
-## Quick start
+## Connect
 
-```
+```sh
 matrirc login @you:homeserver.org
 matrirc run
 ```
 
-In your IRC client: `/connect 127.0.0.1` (or `/connect matrirc` if you
-ran `matrirc install-irssi`, which registers a `matrirc` chatnet).
+Login prompts for your password, saves the session, and starts emoji
+verification. Compare the emoji with another device, such as Element, and
+confirm on both devices.
 
-`login` prompts for your password and walks you through emoji
-verification from another Element device. Config lands in
-`~/.config/matrirc/config.toml`.
+In your IRC client:
 
-## irssi helper
-
-```
-matrirc install-irssi
+```text
+/connect 127.0.0.1 6667
 ```
 
-Drops a Perl script into `~/.irssi/scripts/autorun/`. On irssi load it
-starts the daemon (if not already running), creates a persistent
-`matrirc` chatnet, runs `/connect matrirc`, reconnects on crash, and
-SIGTERMs the daemon on `/quit`.
+Joined Matrix rooms open as IRC channels once the initial sync finishes.
+Channel names use the room's display name and a six-character room-ID suffix,
+such as `#project-AbCdEf`. Names persist across restarts and room renames.
+DMs use query windows named after the peer's display name, converted to an IRC
+nick.
 
-If you prefer not to autorun, skip `install-irssi` and just connect
-manually: `/connect 127.0.0.1 6667` from your IRC client of choice.
+matrirc requests up to 1,000 recent events per room when you connect. To show
+original timestamps in irssi:
 
-For backfilled messages to render with their original send time,
-flip on irssi's server-time display (off by default in 1.4):
-
-```
+```text
 /set show_server_time on
 /save
 ```
 
-## Media
+### irssi helper
 
-Matrix attachments are gated behind authenticated media or E2EE
-keys — IRC clients can't fetch them directly. Matrirc binds a
-second listener on `127.0.0.1:6680` and rewrites image/file/audio/
-video msgtypes to `<http://127.0.0.1:6680/attach/<event_id>>`. The
-proxy looks up the indexed `MediaSource`, downloads via the
-authenticated client, decrypts E2EE blobs, returns plaintext.
-
-Setup:
-
-```
-matrirc install-irssi --media
-# restart irssi (or /script load matrirc-media)
+```sh
+matrirc install-irssi
 ```
 
-Commands (run from a channel or query window — that's the scope):
+This installs `~/.irssi/scripts/autorun/matrirc.pl`. When loaded, the script
+starts matrirc if needed, creates a `matrirc` network, and connects to it.
+It checks the daemon every five seconds and restarts it if it stops; irssi
+handles reconnection. On quit or script unload, it stops the daemon if the
+script started it.
 
-```
-/mediashow [N|name|nick]            fetch + open via $MATRIRC_IMG_OPEN
-/mediasave [N|name|nick] [dir]      fetch + save (default ~/Downloads)
-/medialist [all]                    history; `all` for cross-channel
-/mediasend <path> [caption]         upload a local file to the active room
-```
+After upgrading matrirc, update the installed script with:
 
-`N` is an index into the current scope's history. A bare nick
-(`/mediashow alice`) returns that user's most recent attachment;
-a substring (`/mediashow screenshot`) matches the filename. Prefix
-with `#channel` to override scope (`/mediashow #room 3`).
-
-`/mediasend` always targets the active window; the path argument
-tab-completes. Daemon caps uploads at 100 MiB; bigger files come
-back as HTTP 413. Honors `MATRIRC_ATTACH_BIND` if set.
-Run `/statusbar window add matrirc_upload` once for an in-flight indicator.
-Quote paths that contain spaces: `/mediasend "~/My Pics/x.png"`.
-
-## Commands
-
-```
-matrirc login @you:server          password + SAS
-matrirc login ... --token          use an access token (stdin / env)
-matrirc login ... --skip-verify    skip SAS, do it later
-matrirc verify                     redo SAS
-matrirc bootstrap-e2ee             import via recovery key
-matrirc run                        start the daemon
-matrirc status                     check
-matrirc stop                       SIGTERM
-matrirc reset --force              wipe local state
-matrirc install-irssi              drop irssi script
+```sh
+matrirc install-irssi --force
 ```
 
-Once connected, from inside irssi:
+The helper also displays reply IDs. For manual connections, run `matrirc run`
+yourself and use `/connect 127.0.0.1 6667`.
 
-- `/msg matrirc help` — full command reference
-- `/msg matrirc search <term>` — public-room directory search
-- `/msg matrirc join <#alias:server | !room:server>` — join by alias or room id
-- `/msg matrirc knock <target> [reason]` — knock on an invite-only room
-- `/msg matrirc dump <#chan or peer>` — inspect the reply-id ring
-- `/msg matrirc ids on|off|toggle|status` — toggle reply-id tags (default on)
-- `/join #alias:server.org` — join any public Matrix room
-- `/msg @alice:server.org hi` — open or create a DM
-- `!r <id> text` — reply to message `[id]` in the current window
+## Rooms and messages
 
-`/part` of a bridged channel calls Matrix `leave`. To force a fresh
-backfill without leaving, `/disconnect matrirc` and reconnect instead.
+Run these commands in your IRC client:
 
-## Replies
+| Command | Effect |
+| --- | --- |
+| `/msg matrirc help` | Show the full command reference. |
+| `/msg matrirc search <term>` | Search the public-room directory. |
+| `/msg matrirc join <#alias:server or !room:server>` | Join a room by alias or ID. |
+| `/msg matrirc knock <target> [reason]` | Request admission to a room that allows knocking. |
+| `/join #alias:server.org` | Join a Matrix room by alias. |
+| `/msg @alice:server.org hi` | Find or create a DM and send a message. |
+| `/me <action>` | Send a Matrix emote. |
 
-Each inbound Matrix message gets a 3-letter id (FNV hash of the event
-id, stable across daemon restarts). The id rides on the IRCv3 `msgid`
-tag; the autoinstalled `matrirc.pl` script renders it inline:
+**Parting a bridged channel leaves the Matrix room.** To reload history,
+disconnect and reconnect to matrirc.
 
-```
+Text, edits, and replies appear as IRC messages. Reactions appear as actions,
+attachments as local URLs, and topic changes as IRC topics. Messages that
+cannot be decrypted appear as placeholders.
+
+### Replies
+
+The irssi helper displays a three-letter ID beside incoming messages:
+
+```text
 14:33 alice | [abc] could you take a look at this?
 ```
 
-Reply with `!r <id> body`:
+Reply in the same channel or query window:
 
-```
+```text
 !r abc on it
 ```
 
-matrirc resolves the short to a Matrix event id, builds an
-`m.in_reply_to` relation with the body fallback (so Element threads it
-correctly), and sends. The reply line also renders a quote above the
-body in your IRC window.
+matrirc sends a Matrix reply referencing the original event. Incoming replies
+include a quote above the body.
 
-Mis-typed id → message is dropped and matrirc sends a notice to your
-`matrirc` bot window.
+Each connection remembers the last 64 reply targets per window. An ID is
+derived from the Matrix event ID, so it stays the same when history is loaded
+again. If two stored targets share an ID, the newer one wins. An unknown ID
+produces a notice in the `matrirc` window; the message is not sent.
 
-Turn it off:
+To inspect stored targets or hide IDs:
 
-```
+```text
+/msg matrirc dump <#channel or peer>
 /msg matrirc ids off
 ```
 
-Or set `show_reply_ids = false` in `config.toml` for the daemon
-default.
+The `ids` command also accepts `on`, `toggle`, and `status`. Set
+`show_reply_ids = false` in `config.toml` to hide IDs by default.
 
-## How it works
+## Media
 
-Matrirc is one long-running daemon with two tasks talking through a
-small bridge module:
+matrirc serves Matrix attachments through a local HTTP proxy at
+`127.0.0.1:6680`. It downloads attachments using your Matrix session and
+decrypts encrypted files before serving them. Messages contain URLs such as
+`http://127.0.0.1:6680/attach/<event_id>`.
 
-```
-  IRC client ─TCP─▶ irc::serve ─────▶ bridge ◀───── matrix::run_sync ◀─HTTPS/sync─ homeserver
-                       │                 ▲                │
-                       └──────PRIVMSG────┘                └─sqlite crypto/state store
-```
+Install the optional irssi media script:
 
-- `matrix::run_sync` restores the session (from `config.toml`), runs
-  the Matrix sync loop, and keeps the sqlite crypto store under
-  `~/.local/share/matrirc/store/` in sync.
-- `irc::serve` accepts IRC clients on `127.0.0.1:6667`. Each client has
-  its own task + CAP/NICK/USER state.
-- `bridge` is a shared struct holding room↔channel + MXID↔nick maps
-  plus a `broadcast` channel for Matrix→IRC events and an `mpsc` for
-  IRC→Matrix commands.
-
-At startup the sync task walks every joined room, classifies each as
-channel or DM (`is_direct`), picks a stable channel name (slug of the
-display name + 6-char suffix from the room id, persisted in
-`names.json`), and pushes it into the mapping. When an IRC client
-registers, matrirc auto-joins every known channel on its behalf,
-backfills the last 200 messages, and attaches IRCv3 `@time=` tags if
-the client negotiated the cap.
-
-## Paths
-
-```
-~/.config/matrirc/config.toml       access token       0600
-~/.local/share/matrirc/store/       crypto store       0700
-~/.local/share/matrirc/names.json   channel naming
-~/.local/state/matrirc/daemon.pid   pidfile
-~/.local/state/matrirc/log          daemon log (irssi-spawned)
+```sh
+matrirc install-irssi --media --force
 ```
 
-Respects `XDG_CONFIG_HOME` / `XDG_DATA_HOME` / `XDG_STATE_HOME`.
+Restart irssi or run `/script load matrirc-media`. The script uses `curl` to
+transfer files.
 
-## E2EE
+| Command | Effect |
+| --- | --- |
+| `/mediashow [N\|name\|nick]` | Download and open an attachment. |
+| `/mediasave [N\|name\|nick] [dir]` | Save an attachment, by default to `~/Downloads`. |
+| `/medialist [all]` | List attachments in this window, or across windows with `all`. |
+| `/mediasend <path> [caption]` | Upload a file to the active room or DM. |
 
-Password login gives you a fresh, unverified device. SAS emoji
-verification cross-signs it. After that other clients share megolm
-room keys with you.
+Selection uses the current window's attachment history. Use an index, a
+filename substring, or a nick to select that user's latest attachment.
+Prefix a selection with a channel to use its history, for example
+`/mediashow #project-AbCdEf 3`.
 
-Historic messages need the server-side key backup. SAS pulls the
-backup key with it when Element has one set up; otherwise old messages
-stay encrypted. `matrirc verify` prints the current state.
+`/mediasend` supports path completion. Quote paths containing spaces:
 
-Recovery-key path: `matrirc bootstrap-e2ee` reads
-`MATRIRC_RECOVERY_KEY` (or stdin), opens SSS, pulls cross-signing +
-backup directly. The key is not stored anywhere.
-
-## Naming
-
-Rooms show up as `#slug-<6char>` where `<6char>` comes from the room
-id localpart. Stable across renames. DMs open as IRC queries to the
-peer's display-name (ASCII-sanitized).
-
-Events:
-- text / edit / reply / emote → `PRIVMSG`
-- reaction → `* nick reacted X` (CTCP ACTION)
-- image/file/audio/video → `[image] caption <https-url>`
-- topic change → `TOPIC`
-- undecryptable → placeholder line
-
-## Env
-
-- `MATRIRC_PASSWORD` — skip prompt
-- `MATRIRC_TOKEN` — for `--token`
-- `MATRIRC_RECOVERY_KEY` — for `bootstrap-e2ee`
-- `MATRIRC_ROOM` — bridge only this room id as `#matrix` (dev)
-- `MATRIRC_BIND` — override IRC listen addr (default `127.0.0.1:6667`)
-- `MATRIRC_ATTACH_BIND` — override media-proxy listen addr (default `127.0.0.1:6680`)
-- `RUST_LOG` — `tracing-subscriber` filter
-
-## Building
-
+```text
+/mediasend "~/My Pics/x.png" screenshot
+/statusbar window add matrirc_upload
 ```
+
+The statusbar item shows upload progress. Uploads over 100 MiB are rejected
+with HTTP 413.
+
+Set `MATRIRC_IMG_OPEN` before starting irssi to choose the opener (default:
+`open`), and `MATRIRC_SAVE_DIR` to change the save directory. If you change
+`MATRIRC_ATTACH_BIND`, use the same value for the daemon and irssi.
+
+## Login and encryption
+
+Password login creates a new Matrix device. If verification fails or you use
+`--skip-verify`, retry it with:
+
+```sh
+matrirc verify
+```
+
+This also reports the device's encryption and backup state. Decrypting old
+messages requires the corresponding room keys. If they are in your Matrix
+key backup, recover access with:
+
+```sh
+matrirc bootstrap-e2ee
+```
+
+Supply the recovery key through `MATRIRC_RECOVERY_KEY` or standard input.
+The command imports cross-signing and backup secrets from Matrix secret
+storage. It does not save the supplied recovery key. History remains
+unreadable if the required room keys are unavailable. Restart the daemon after
+recovery.
+
+matrirc does not support SSO, OIDC, or QR sign-in. For an account that requires
+one of these, supply an access token through `MATRIRC_TOKEN` or standard input:
+
+```sh
+matrirc login @you:homeserver.org --token
+```
+
+Use `--homeserver https://matrix.example.org` to override homeserver discovery.
+
+## Daemon commands
+
+| Command | Effect |
+| --- | --- |
+| `matrirc run` | Run the daemon in the foreground. This is also the default command. |
+| `matrirc status` | Check whether the daemon is running. |
+| `matrirc stop` | Send SIGTERM to the daemon. |
+| `matrirc reset` | Delete the local session, crypto store, and saved channel names after confirmation. |
+
+`reset --force` skips confirmation. Resetting does not sign out the device on
+the homeserver; remove the old session in another Matrix client.
+
+## Configuration and files
+
+Login writes `~/.config/matrirc/config.toml` with your Matrix user ID,
+homeserver URL, access token, and device ID.
+
+| Default path | Contents |
+| --- | --- |
+| `~/.config/matrirc/config.toml` | Session and settings; created with mode `0600`. |
+| `~/.local/share/matrirc/store/` | Matrix state and crypto store; directory mode `0700`. |
+| `~/.local/share/matrirc/names.json` | Saved channel names. |
+| `~/.local/state/matrirc/daemon.pid` | Daemon PID file. |
+| `~/.local/state/matrirc/log` | Output from a daemon started by the irssi helper. |
+
+The daemon respects `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, and `XDG_STATE_HOME`.
+The irssi helper uses `~/.local/state/matrirc` for its log and PID lookup.
+
+| Environment variable | Purpose |
+| --- | --- |
+| `MATRIRC_PASSWORD` | Supply the login password without a prompt. |
+| `MATRIRC_TOKEN` | Supply the access token for `login --token`. |
+| `MATRIRC_RECOVERY_KEY` | Supply the key for `bootstrap-e2ee`. |
+| `MATRIRC_BIND` | IRC listen address; default `127.0.0.1:6667`. |
+| `MATRIRC_ATTACH_BIND` | Media listen address; default `127.0.0.1:6680`. |
+| `MATRIRC_ROOM` | Limit initial room discovery to this room ID, for development. |
+| `RUST_LOG` | Set the tracing filter; default `matrirc=info`. |
+
+One daemon serves one Matrix account. The IRC listener has no TLS, and the
+media proxy serves decrypted files. Keep both listeners on loopback.
+
+## Development
+
+Build with Rust 1.95 or newer:
+
+```sh
 cargo build --release
 cargo test
+cargo clippy --all-targets -- -D warnings
 ```
 
-Rust 1.95+. First build takes a few minutes.
+CI runs tests and Clippy on Linux and macOS with stable Rust.
 
-## Caveats
+The daemon uses Tokio. `src/matrix.rs` restores the session, runs Matrix sync,
+and sends Matrix requests. `src/irc/conn.rs` handles each IRC connection.
+`src/bridge.rs` holds room and nick mappings, broadcasts Matrix events to IRC
+clients, and queues IRC commands for the Matrix task. `src/proxy.rs` serves
+attachments and accepts uploads; `src/names.rs` persists channel names.
 
-- No SSO / OIDC / QR sign-in. On homeservers that only advertise those
-  (matrix.org, anything behind MAS), grab an access token from Element
-  and run `matrirc login ... --token`.
-- Single account per daemon.
-- IRC listener binds `127.0.0.1` without TLS. Don't expose it.
+For debug logs:
+
+```sh
+RUST_LOG=matrirc=debug,matrix_sdk=info matrirc run
+```
 
 ## License
 
-GPL-3.0-or-later.
+GPL-3.0-or-later. See [LICENSE](LICENSE).
