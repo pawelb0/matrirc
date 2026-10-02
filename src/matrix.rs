@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -9,6 +10,7 @@ use matrix_sdk::room::MessagesOptions;
 use matrix_sdk::ruma::events::reaction::SyncReactionEvent;
 use matrix_sdk::ruma::events::room::encrypted::SyncRoomEncryptedEvent;
 use matrix_sdk::ruma::events::room::member::{MembershipChange, SyncRoomMemberEvent};
+use matrix_sdk::ruma::events::room::redaction::{OriginalSyncRoomRedactionEvent, SyncRoomRedactionEvent};
 use matrix_sdk::ruma::events::room::message::{
     MessageType, Relation, RoomMessageEventContent, SyncRoomMessageEvent,
 };
@@ -18,6 +20,7 @@ use matrix_sdk::ruma::events::room::MediaSource;
 use matrix_sdk::ruma::events::{
     AnySyncMessageLikeEvent, AnySyncTimelineEvent, Mentions, SyncMessageLikeEvent,
 };
+use matrix_sdk::ruma::{EventId, OwnedEventId};
 use matrix_sdk::store::RoomLoadSettings;
 use matrix_sdk::{Client, EncryptionState, Room, RoomMemberships, RoomState, SessionMeta, SessionTokens};
 use serde::Deserialize;
@@ -446,13 +449,80 @@ async fn synthesise_reply_quote(
         MessageType::Emote(t) => format!("/me {}", t.body),
         _ => return None,
     };
-    let first_line = strip_reply_fallback(&body);
-    let snippet = first_line.lines().next().unwrap_or("").trim();
-    if snippet.is_empty() { return None; }
+    let snippet = snippet_line(&body)?;
     let nick = sender_nick(room, &orig.sender).await;
-    let capped: String = snippet.chars().take(60).collect();
-    let suffix = if snippet.chars().count() > 60 { "..." } else { "" };
-    Some(format!("{C_GREY}↳ <{nick}> {capped}{suffix}{C_RESET}"))
+    Some(format!("{C_GREY}↳ <{nick}> {snippet}{C_RESET}"))
+}
+
+/// First line of `body`, limited for single-line display.
+fn snippet_line(body: &str) -> Option<String> {
+    let clean = strip_reply_fallback(body);
+    let line = clean.lines().next().unwrap_or("").trim();
+    if line.is_empty() { return None; }
+    let capped: String = line.chars().take(60).collect();
+    let suffix = if line.chars().count() > 60 { "..." } else { "" };
+    Some(format!("{capped}{suffix}"))
+}
+
+/// Body of a redaction notice: what went away, plus the reason when there is one.
+fn delete_body(snippet: Option<String>, reason: Option<&str>) -> String {
+    let mut body = format!("{C_GREY}* delete:{C_RESET}");
+    if let Some(s) = snippet {
+        body.push(' ');
+        body.push_str(&s);
+    }
+    let reason = reason
+        .map(|r| r.lines().next().unwrap_or("").trim())
+        .filter(|r| !r.is_empty());
+    if let Some(r) = reason {
+        body.push_str(&format!(" {C_GREY}(reason: {r}){C_RESET}"));
+    }
+    body
+}
+
+/// The `redacts` target of a redaction.
+fn redaction_target(orig: &OriginalSyncRoomRedactionEvent) -> Option<&EventId> {
+    // Room v11 is content.redacts, older is just redacts.
+    orig.redacts.as_deref().or(orig.content.redacts.as_deref())
+}
+
+/// Bodies of the messages we've forwarded, keyed by event id, for redaction purposes.
+#[derive(Default)]
+struct BodyIndex {
+    state: std::sync::Mutex<BodyIndexState>,
+}
+
+#[derive(Default)]
+struct BodyIndexState {
+    map: HashMap<OwnedEventId, String>,
+    fifo: VecDeque<OwnedEventId>,
+}
+
+/// How many forwarded bodies to keep around for redaction quotes.
+const MAX_BODIES: usize = 1024;
+
+impl BodyIndex {
+    fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    fn insert(&self, event_id: OwnedEventId, body: String) {
+        let mut s = self.state.lock().unwrap();
+        if !s.map.contains_key(&event_id) {
+            s.fifo.push_back(event_id.clone());
+            // Grew too large? Then remove old events.
+            while s.fifo.len() > MAX_BODIES {
+                if let Some(old) = s.fifo.pop_front() {
+                    s.map.remove(&old);
+                }
+            }
+        }
+        s.map.insert(event_id, body);
+    }
+
+    fn get(&self, id: &EventId) -> Option<String> {
+        self.state.lock().unwrap().map.get(id).cloned()
+    }
 }
 
 fn msgtype_body(
@@ -913,6 +983,7 @@ async fn backfill(
     only_unread: bool,
     attach_base: &str,
     attach_index: &crate::proxy::AttachIndex,
+    bodies: &BodyIndex,
 ) -> Vec<BackfillMessage> {
     let Some(room) = client.get_room(room_id) else { return Vec::new(); };
     if matches!(room.encryption_state(), EncryptionState::Encrypted) {
@@ -988,6 +1059,7 @@ async fn backfill(
                         decoded.body = strip_grey_arrow_prefix(decoded.body);
                     }
                 }
+                bodies.insert(orig.event_id.clone(), decoded.body.clone());
                 out.push(BackfillMessage {
                     sender_nick: sender_nick(&room, &orig.sender).await,
                     body: decoded.body,
@@ -1015,6 +1087,20 @@ async fn backfill(
                 out.push(BackfillMessage {
                     sender_nick: sender_nick(&room, &orig.sender).await,
                     body: format!("\x01ACTION reacted {}\x01", orig.content.relates_to.key),
+                    reply_quote: None,
+                    origin_ms: orig.origin_server_ts.0.into(),
+                    event_id: orig.event_id.clone(),
+                    is_own: Some(orig.sender.as_ref()) == client.user_id(),
+                });
+            }
+            AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomRedaction(
+                SyncRoomRedactionEvent::Original(orig),
+            )) => {
+                let Some(target) = redaction_target(&orig) else { continue; };
+                let snippet = bodies.get(target);
+                out.push(BackfillMessage {
+                    sender_nick: sender_nick(&room, &orig.sender).await,
+                    body: delete_body(snippet, orig.content.reason.as_deref()),
                     reply_quote: None,
                     origin_ms: orig.origin_server_ts.0.into(),
                     event_id: orig.event_id.clone(),
@@ -1144,6 +1230,7 @@ pub async fn run_sync(
     );
 
     let attach_index = crate::proxy::AttachIndex::new();
+    let body_index = BodyIndex::new();
     let attach_addr: std::net::SocketAddr = std::env::var("MATRIRC_ATTACH_BIND")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -1265,14 +1352,36 @@ pub async fn run_sync(
 
     {
         let bridge = bridge.clone();
+        let own = own_id.clone();
+        let body_index = body_index.clone();
+        client.add_event_handler(move |ev: SyncRoomRedactionEvent, room: Room| {
+            let bridge = bridge.clone();
+            let own = own.clone();
+            let body_index = body_index.clone();
+            async move {
+                let Some(orig) = ev.as_original() else { return; };
+                let Some(target) = redaction_target(orig) else { return; };
+                let Some((nick, is_own)) = accept_event(&bridge, &room, &orig.event_id, &orig.sender, &own).await else { return; };
+                let snippet = body_index.get(target);
+                emit_message(&bridge, room.room_id(), nick,
+                    delete_body(snippet, orig.content.reason.as_deref()),
+                    None, Some(orig.event_id.clone()), is_own, false);
+            }
+        });
+    }
+
+    {
+        let bridge = bridge.clone();
         let own = own_id;
         let attach_base = attach_base.clone();
         let attach_index = attach_index.clone();
+        let body_index = body_index.clone();
         client.add_event_handler(move |ev: SyncRoomMessageEvent, room: Room| {
             let bridge = bridge.clone();
             let own = own.clone();
             let attach_base = attach_base.clone();
             let attach_index = attach_index.clone();
+            let body_index = body_index.clone();
             async move {
                 let Some(orig) = ev.as_original() else { return; };
                 let Some((nick, is_own)) = accept_event(&bridge, &room, &orig.event_id, &orig.sender, &own).await else { return; };
@@ -1289,6 +1398,7 @@ pub async fn run_sync(
                     .mentions
                     .as_ref()
                     .is_some_and(|m| m.user_ids.contains(&own));
+                body_index.insert(orig.event_id.clone(), decoded.body.clone());
                 emit_message(&bridge, room.room_id(), nick, decoded.body, decoded.quote,
                     Some(orig.event_id.clone()), is_own, mentions_self);
             }
@@ -1299,6 +1409,7 @@ pub async fn run_sync(
     let send_bridge = bridge.clone();
     let attach_base_sender = attach_base.clone();
     let attach_index_sender = attach_index.clone();
+    let body_index_sender = body_index.clone();
     let name_store_for_sender = name_store.clone();
     tokio::spawn(async move {
         while let Some(cmd) = to_matrix.recv().await {
@@ -1313,7 +1424,8 @@ pub async fn run_sync(
                     let only_unread = !send_bridge
                         .default_backfill_read_messages
                         .load(std::sync::atomic::Ordering::Relaxed);
-                    let result = backfill(&send_client, &room, limit, only_unread, &attach_base_sender, &attach_index_sender).await;
+                    let result = backfill(&send_client, &room, limit, only_unread,
+                        &attach_base_sender, &attach_index_sender, &body_index_sender).await;
                     let _ = reply.send(result);
                 }
                 ToMatrix::Members { room, reply } => {
@@ -1672,6 +1784,54 @@ mod tests {
     fn strip_reply_fallback_drops_quoted_header() {
         let src = "> <@a:h> first line\n> second line\n\nactual reply";
         assert_eq!(strip_reply_fallback(src), "actual reply");
+    }
+
+    #[test]
+    fn snippet_line_takes_first_line_and_caps() {
+        assert_eq!(snippet_line("first\nsecond").as_deref(), Some("first"));
+        assert_eq!(snippet_line("> <@a:h> q\n\nreply").as_deref(), Some("reply"));
+        assert_eq!(snippet_line("   \n\n"), None);
+        let long = "x".repeat(80);
+        let out = snippet_line(&long).unwrap();
+        assert_eq!(out.len(), 63, "{out}");
+        assert!(out.ends_with("..."), "{out}");
+    }
+
+    #[test]
+    fn delete_body_shows_snippet_and_reason() {
+        assert_eq!(
+            delete_body(Some("bye".into()), None),
+            format!("{C_GREY}* delete:{C_RESET} bye")
+        );
+        assert_eq!(
+            delete_body(Some("bye".into()), Some("spam")),
+            format!("{C_GREY}* delete:{C_RESET} bye {C_GREY}(reason: spam){C_RESET}")
+        );
+    }
+
+    #[test]
+    fn delete_body_degrades_without_snippet_or_reason() {
+        assert_eq!(delete_body(None, None), format!("{C_GREY}* delete:{C_RESET}"));
+        assert_eq!(delete_body(None, Some("  \n ")), format!("{C_GREY}* delete:{C_RESET}"));
+        assert_eq!(
+            delete_body(None, Some("moderated")),
+            format!("{C_GREY}* delete:{C_RESET} {C_GREY}(reason: moderated){C_RESET}")
+        );
+    }
+
+    #[test]
+    fn body_index_round_trips_and_evicts_oldest() {
+        let idx = BodyIndex::new();
+        let id = evt("$abc:server.tld");
+        assert!(idx.get(&id).is_none());
+        idx.insert(id.clone(), "hello".into());
+        assert_eq!(idx.get(&id).as_deref(), Some("hello"));
+        for i in 0..(MAX_BODIES + 5) {
+            idx.insert(evt(&format!("$e{i}:server.tld")), "x".into());
+        }
+        assert!(idx.get(&id).is_none());
+        let newest = evt(&format!("$e{}:server.tld", MAX_BODIES + 4));
+        assert!(idx.get(&newest).is_some());
     }
 
     fn cand(start: usize, end: usize, key: &str, has_at: bool) -> MentionCandidate {
