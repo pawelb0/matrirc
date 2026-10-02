@@ -102,7 +102,9 @@ Run these commands in your IRC client:
 **Parting a bridged channel leaves the Matrix room.** To reload history,
 disconnect and reconnect to matrirc.
 
-Text, edits, and replies appear as IRC messages. Reactions appear as actions,
+Text, edits, and replies appear as IRC messages. Redacted messages appear as
+`* delete:` notices, quoting the removed text when matrirc saw it earlier (and
+the reason, when the redactor gave one). Reactions appear as actions,
 attachments as local URLs, and topic changes as IRC topics. Messages that
 cannot be decrypted appear as placeholders.
 
