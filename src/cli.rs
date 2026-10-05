@@ -245,15 +245,18 @@ pub fn install_irssi(
     bin: Option<PathBuf>,
     media: bool,
 ) -> Result<()> {
-    // Bare `matrirc` resolves via $PATH at runtime, so the script survives
-    // brew upgrades or the binary moving.
-    let script = match bin {
-        Some(p) => {
-            let s = p.to_str().ok_or_else(|| anyhow!("non-utf8 path: {}", p.display()))?;
-            render_from_str(s)?
-        }
-        None => render_from_str("matrirc")?,
+    // Irssi may not inherit the installer's PATH, so embed this executable.
+    let bin = match bin {
+        Some(p) => p,
+        None => installed_bin_path()?,
     };
+    let bin = if bin.is_absolute() {
+        bin
+    } else {
+        std::env::current_dir()?.join(bin)
+    };
+    let bin = bin.to_str().ok_or_else(|| anyhow!("non-utf8 path: {}", bin.display()))?;
+    let script = render_from_str(bin)?;
 
     if dry_run {
         print!("{script}");
@@ -272,6 +275,28 @@ pub fn install_irssi(
         println!("now: /script load matrirc-media");
     }
     Ok(())
+}
+
+fn installed_bin_path() -> Result<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+
+    let exe = std::env::current_exe()?;
+    let exe_meta = exe.metadata()?;
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join("matrirc");
+            if let Ok(meta) = candidate.metadata() {
+                if meta.is_file() && meta.dev() == exe_meta.dev() && meta.ino() == exe_meta.ino() {
+                    return Ok(if candidate.is_absolute() {
+                        candidate
+                    } else {
+                        std::env::current_dir()?.join(candidate)
+                    });
+                }
+            }
+        }
+    }
+    Ok(exe)
 }
 
 fn install_pl(name: &str, contents: &str, force: bool) -> Result<()> {

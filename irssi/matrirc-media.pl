@@ -545,7 +545,7 @@ Irssi::signal_add_first('complete word', sub {
     Irssi::signal_stop();
 });
 
-Irssi::statusbar_item_register('matrirc_upload', undef, 'upload_status_item');
+Irssi::statusbar_item_register('matrirc_upload', '', 'upload_status_item');
 
 Irssi::print("matrirc-media $VERSION loaded; /mediashow, /mediasave, /medialist, /mediasend");
 Irssi::print("upload statusbar: /statusbar window add matrirc_upload  (one-time)");
