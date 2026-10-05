@@ -69,6 +69,9 @@ matrirc install-irssi
 
 This installs `~/.irssi/scripts/autorun/matrirc.pl`. When loaded, the script
 starts matrirc if needed, creates a `matrirc` network, and connects to it.
+The installer records the executable path, so Irssi can start the daemon even
+when its `PATH` differs from your shell's. Use `--bin /path/to/matrirc` to
+select a specific executable.
 It checks the daemon every five seconds and restarts it if it stops; irssi
 handles reconnection. On quit or script unload, it stops the daemon if the
 script started it.
@@ -235,7 +238,7 @@ homeserver URL, access token, and device ID.
 | `~/.local/state/matrirc/log` | Output from a daemon started by the irssi helper. |
 
 The daemon respects `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, and `XDG_STATE_HOME`.
-The irssi helper uses `~/.local/state/matrirc` for its log and PID lookup.
+The irssi helper also respects `XDG_STATE_HOME` for its log and PID lookup.
 
 | Environment variable | Purpose |
 | --- | --- |

@@ -2,6 +2,8 @@ use strict;
 use warnings;
 use Irssi;
 use IO::Socket::INET;
+use File::Path qw(make_path);
+use POSIX qw(setsid _exit);
 
 our $VERSION = '0.3.0';
 our %IRSSI = (
@@ -18,7 +20,8 @@ if (my $bind = $ENV{MATRIRC_BIND}) {
         ($HOST, $PORT) = ($1, $2 + 0);
     }
 }
-my $STATE_DIR = "$ENV{HOME}/.local/state/matrirc";
+my $STATE_DIR = (defined $ENV{XDG_STATE_HOME} ? $ENV{XDG_STATE_HOME}
+                  : "$ENV{HOME}/.local/state") . '/matrirc';
 my $LOG       = "$STATE_DIR/log";
 my $PID_FILE  = "$STATE_DIR/daemon.pid";
 
@@ -63,6 +66,13 @@ sub have_irc_connection {
     return 0;
 }
 
+sub irc_connected {
+    for my $s (Irssi::servers()) {
+        return 1 if $s->{address} eq $HOST && $s->{port} == $PORT && $s->{connected};
+    }
+    return 0;
+}
+
 sub read_pid {
     open(my $fh, '<', $PID_FILE) or return undef;
     my $pid = <$fh>;
@@ -81,8 +91,35 @@ sub spawn_daemon {
     my $now = time();
     return if $spawn_cooldown > $now;
     $spawn_cooldown = $now + $SPAWN_GRACE;
-    system("mkdir -p '$STATE_DIR'");
-    system("nohup '$BIN' run >>'$LOG' 2>&1 </dev/null &");
+    eval { make_path($STATE_DIR); 1 } or do {
+        Irssi::print("matrirc: cannot create $STATE_DIR: $@");
+        return;
+    };
+    open(my $logfh, '>>', $LOG) or do {
+        Irssi::print("matrirc: cannot open $LOG: $!");
+        return;
+    };
+    my $pid = fork();
+    if (!defined $pid) {
+        Irssi::print("matrirc: fork failed: $!");
+        close $logfh;
+        return;
+    }
+    if ($pid == 0) {
+        open(STDIN, '<', '/dev/null') or _exit(127);
+        open(STDOUT, '>&', $logfh) or _exit(127);
+        open(STDERR, '>&', $logfh) or _exit(127);
+        close $logfh;
+        if (!setsid()) {
+            print STDERR "matrirc: setsid failed: $!\n";
+            _exit(127);
+        }
+        if (!exec { $BIN } $BIN, 'run') {
+            print STDERR "matrirc: exec $BIN failed: $!\n";
+            _exit(127);
+        }
+    }
+    close $logfh;
     $spawned_by_us = 1;
 }
 
@@ -122,15 +159,17 @@ sub poll {
     }
 
     if (!$initial_connect_done) {
-        set_state('starting', 'matrirc: daemon up, connecting');
+        set_state('starting', 'matrirc: IRC port open, connecting');
         ensure_chatnet();
-        Irssi::command("connect matrirc");
+        Irssi::command("connect matrirc") unless have_irc_connection();
         $initial_connect_done = 1;
         return;
     }
 
-    if (have_irc_connection()) {
+    if (irc_connected()) {
         set_state('connected', 'matrirc: connected');
+    } else {
+        set_state('starting', 'matrirc: waiting for IRC connection');
     }
     # If connection is gone, irssi's native auto-reconnect handles it.
     # Issuing another `connect matrirc` here races with the reconnect queue
