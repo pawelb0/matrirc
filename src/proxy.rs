@@ -183,9 +183,16 @@ async fn handle_get(
         .nth(1)
         .ok_or_else(|| anyhow!("malformed request"))?;
 
-    let id_str = match path.strip_prefix("/attach/") {
-        Some(s) => percent_decode(s),
-        None => return write_status(&mut sock, 404, "Not Found").await,
+    let Some(id_str) = path.strip_prefix("/attach/") else {
+        return write_status(&mut sock, 404, "Not Found").await;
+    };
+
+    let (id_str, content_disposition) = match id_str.split_once('/') {
+        Some((id, filename)) => (
+            percent_decode(id),
+            format!("Content-Disposition: attachment; filename=\"{}\"\r\n", percent_decode(filename).replace(['/', '\\', '"', '\''], "_"))
+        ),
+        None => (percent_decode(id_str), "".into()),
     };
     let event_id = match EventId::parse(&id_str) {
         Ok(id) => id,
@@ -209,8 +216,9 @@ async fn handle_get(
          Content-Type: application/octet-stream\r\n\
          Content-Length: {}\r\n\
          Cache-Control: private, max-age=86400\r\n\
-         Connection: close\r\n\r\n",
-        bytes.len()
+         Connection: close\r\n{}\r\n",
+        bytes.len(),
+        content_disposition
     );
     sock.write_all(header.as_bytes()).await?;
     sock.write_all(&bytes).await?;

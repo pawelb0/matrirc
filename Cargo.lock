@@ -1778,6 +1778,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "unidecode",
+ "urlencoding",
 ]
 
 [[package]]
