@@ -104,9 +104,10 @@ disconnect and reconnect to matrirc.
 
 Text, edits, and replies appear as IRC messages. Redacted messages appear as
 `* delete:` notices, quoting the removed text when matrirc saw it earlier (and
-the reason, when the redactor gave one). Reactions appear as actions,
-attachments as local URLs, and topic changes as IRC topics. Messages that
-cannot be decrypted appear as placeholders.
+the reason, when the redactor gave one). Reactions quote the message they
+target, then appear as actions. Attachments appear as local URLs, and topic
+changes as IRC topics. Messages that cannot be decrypted appear as
+placeholders.
 
 ### Replies
 
