@@ -425,9 +425,9 @@ fn strip_grey_arrow_prefix(body: String) -> String {
 
 /// Async fallback for replies whose body doesn't carry the matrix `>`-quoted
 /// fallback (matrirc's own pre-fix outbounds, mostly). Fetches the parent
-/// event from the room store and builds a single-line `↳ <sender> snippet`.
-/// Returns `None` if the event isn't a reply, the parent can't be fetched,
-/// or its content isn't a text-like message.
+/// event and builds a single-line `↳ <sender> snippet`. Returns `None` if the
+/// event isn't a reply, the parent can't be fetched, or its content isn't a
+/// text-like message.
 async fn synthesise_reply_quote(
     room: &Room,
     content: &RoomMessageEventContent,
@@ -437,7 +437,13 @@ async fn synthesise_reply_quote(
         Some(Relation::Thread(t)) if !t.is_falling_back => t.in_reply_to.as_ref()?.event_id.clone(),
         _ => return None,
     };
-    let evt = room.event(&target_id, None).await.ok()?;
+    quote_of_event(room, &target_id).await
+}
+
+/// Fetched `↳ <sender> snippet` quote of `target`; `None` when it can't be
+/// fetched or isn't a text-like message.
+async fn quote_of_event(room: &Room, target: &EventId) -> Option<String> {
+    let evt = room.load_or_fetch_event(target, None).await.ok()?;
     let parsed = evt.raw().deserialize().ok()?;
     let AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
         SyncMessageLikeEvent::Original(orig),
@@ -451,7 +457,25 @@ async fn synthesise_reply_quote(
     };
     let snippet = snippet_line(&body)?;
     let nick = sender_nick(room, &orig.sender).await;
-    Some(format!("{C_GREY}↳ <{nick}> {snippet}{C_RESET}"))
+    Some(quote_line(&nick, &snippet))
+}
+
+/// Quote of a reaction's target, so it's clear which message was reacted to
+/// when several arrived in a row. Uses our own record of what we forwarded
+/// first (covers freshly-sent messages), then the room store.
+async fn reaction_quote(room: &Room, target: &EventId, bodies: &BodyIndex) -> Option<String> {
+    if let Some(sent) = bodies.get(target) {
+        if let Some(q) = sent_quote(&sent) { return Some(q); }
+    }
+    quote_of_event(room, target).await
+}
+
+fn sent_quote(sent: &SentBody) -> Option<String> {
+    Some(quote_line(&sent.nick, &snippet_line(&sent.body)?))
+}
+
+fn quote_line(nick: &str, snippet: &str) -> String {
+    format!("{C_GREY}↳ <{nick}> {snippet}{C_RESET}")
 }
 
 /// First line of `body`, limited for single-line display.
@@ -486,7 +510,14 @@ fn redaction_target(orig: &OriginalSyncRoomRedactionEvent) -> Option<&EventId> {
     orig.redacts.as_deref().or(orig.content.redacts.as_deref())
 }
 
-/// Bodies of the messages we've forwarded, keyed by event id, for redaction purposes.
+/// A forwarded message: who sent it and the body put on IRC.
+#[derive(Clone)]
+struct SentBody {
+    nick: String,
+    body: String,
+}
+
+/// Messages we've forwarded, keyed by event id, for redaction and reaction quotes.
 #[derive(Default)]
 struct BodyIndex {
     state: std::sync::Mutex<BodyIndexState>,
@@ -494,11 +525,11 @@ struct BodyIndex {
 
 #[derive(Default)]
 struct BodyIndexState {
-    map: HashMap<OwnedEventId, String>,
+    map: HashMap<OwnedEventId, SentBody>,
     fifo: VecDeque<OwnedEventId>,
 }
 
-/// How many forwarded bodies to keep around for redaction quotes.
+/// How many forwarded messages to keep around for quotes.
 const MAX_BODIES: usize = 1024;
 
 impl BodyIndex {
@@ -506,7 +537,7 @@ impl BodyIndex {
         Arc::new(Self::default())
     }
 
-    fn insert(&self, event_id: OwnedEventId, body: String) {
+    fn insert(&self, event_id: OwnedEventId, nick: String, body: String) {
         let mut s = self.state.lock().unwrap();
         if !s.map.contains_key(&event_id) {
             s.fifo.push_back(event_id.clone());
@@ -517,10 +548,10 @@ impl BodyIndex {
                 }
             }
         }
-        s.map.insert(event_id, body);
+        s.map.insert(event_id, SentBody { nick, body });
     }
 
-    fn get(&self, id: &EventId) -> Option<String> {
+    fn get(&self, id: &EventId) -> Option<SentBody> {
         self.state.lock().unwrap().map.get(id).cloned()
     }
 }
@@ -1059,9 +1090,10 @@ async fn backfill(
                         decoded.body = strip_grey_arrow_prefix(decoded.body);
                     }
                 }
-                bodies.insert(orig.event_id.clone(), decoded.body.clone());
+                let nick = sender_nick(&room, &orig.sender).await;
+                bodies.insert(orig.event_id.clone(), nick.clone(), decoded.body.clone());
                 out.push(BackfillMessage {
-                    sender_nick: sender_nick(&room, &orig.sender).await,
+                    sender_nick: nick,
                     body: decoded.body,
                     reply_quote: decoded.quote,
                     origin_ms: orig.origin_server_ts.0.into(),
@@ -1084,10 +1116,11 @@ async fn backfill(
             AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::Reaction(
                 SyncMessageLikeEvent::Original(orig),
             )) => {
+                let quote = reaction_quote(&room, &orig.content.relates_to.event_id, bodies).await;
                 out.push(BackfillMessage {
                     sender_nick: sender_nick(&room, &orig.sender).await,
                     body: format!("\x01ACTION reacted {}\x01", orig.content.relates_to.key),
-                    reply_quote: None,
+                    reply_quote: quote,
                     origin_ms: orig.origin_server_ts.0.into(),
                     event_id: orig.event_id.clone(),
                     is_own: Some(orig.sender.as_ref()) == client.user_id(),
@@ -1097,7 +1130,7 @@ async fn backfill(
                 SyncRoomRedactionEvent::Original(orig),
             )) => {
                 let Some(target) = redaction_target(&orig) else { continue; };
-                let snippet = bodies.get(target);
+                let snippet = bodies.get(target).map(|s| s.body);
                 out.push(BackfillMessage {
                     sender_nick: sender_nick(&room, &orig.sender).await,
                     body: delete_body(snippet, orig.content.reason.as_deref()),
@@ -1269,15 +1302,18 @@ pub async fn run_sync(
     {
         let bridge = bridge.clone();
         let own = own_id.clone();
+        let body_index = body_index.clone();
         client.add_event_handler(move |ev: SyncReactionEvent, room: Room| {
             let bridge = bridge.clone();
             let own = own.clone();
+            let body_index = body_index.clone();
             async move {
                 let Some(orig) = ev.as_original() else { return; };
                 let Some((nick, is_own)) = accept_event(&bridge, &room, &orig.event_id, &orig.sender, &own).await else { return; };
+                let quote = reaction_quote(&room, &orig.content.relates_to.event_id, &body_index).await;
                 emit_message(&bridge, room.room_id(), nick,
                     format!("\x01ACTION reacted {}\x01", orig.content.relates_to.key),
-                    None, Some(orig.event_id.clone()), is_own, false);
+                    quote, Some(orig.event_id.clone()), is_own, false);
             }
         });
     }
@@ -1362,7 +1398,7 @@ pub async fn run_sync(
                 let Some(orig) = ev.as_original() else { return; };
                 let Some(target) = redaction_target(orig) else { return; };
                 let Some((nick, is_own)) = accept_event(&bridge, &room, &orig.event_id, &orig.sender, &own).await else { return; };
-                let snippet = body_index.get(target);
+                let snippet = body_index.get(target).map(|s| s.body);
                 emit_message(&bridge, room.room_id(), nick,
                     delete_body(snippet, orig.content.reason.as_deref()),
                     None, Some(orig.event_id.clone()), is_own, false);
@@ -1398,7 +1434,7 @@ pub async fn run_sync(
                     .mentions
                     .as_ref()
                     .is_some_and(|m| m.user_ids.contains(&own));
-                body_index.insert(orig.event_id.clone(), decoded.body.clone());
+                body_index.insert(orig.event_id.clone(), nick.clone(), decoded.body.clone());
                 emit_message(&bridge, room.room_id(), nick, decoded.body, decoded.quote,
                     Some(orig.event_id.clone()), is_own, mentions_self);
             }
@@ -1824,14 +1860,26 @@ mod tests {
         let idx = BodyIndex::new();
         let id = evt("$abc:server.tld");
         assert!(idx.get(&id).is_none());
-        idx.insert(id.clone(), "hello".into());
-        assert_eq!(idx.get(&id).as_deref(), Some("hello"));
+        idx.insert(id.clone(), "alice".into(), "hello".into());
+        let sent = idx.get(&id).unwrap();
+        assert_eq!((sent.nick.as_str(), sent.body.as_str()), ("alice", "hello"));
         for i in 0..(MAX_BODIES + 5) {
-            idx.insert(evt(&format!("$e{i}:server.tld")), "x".into());
+            idx.insert(evt(&format!("$e{i}:server.tld")), "bob".into(), "x".into());
         }
         assert!(idx.get(&id).is_none());
         let newest = evt(&format!("$e{}:server.tld", MAX_BODIES + 4));
         assert!(idx.get(&newest).is_some());
+    }
+
+    #[test]
+    fn sent_quote_uses_nick_and_first_line() {
+        let sent = SentBody { nick: "alice".into(), body: "hi\nthere".into() };
+        assert_eq!(
+            sent_quote(&sent).as_deref(),
+            Some(format!("{C_GREY}↳ <alice> hi{C_RESET}").as_str())
+        );
+        let empty = SentBody { nick: "alice".into(), body: "\n  ".into() };
+        assert!(sent_quote(&empty).is_none());
     }
 
     fn cand(start: usize, end: usize, key: &str, has_at: bool) -> MentionCandidate {
